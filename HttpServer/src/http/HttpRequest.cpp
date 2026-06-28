@@ -8,6 +8,7 @@ void HttpRequest::setReceiveTime(muduo::Timestamp t)
     receiveTime_ = t;
 }
 
+//解析 HTTP 请求方法字符串，转为枚举值存储
 bool HttpRequest::setMethod(const char *start, const char *end)
 {
     assert(method_ == kInvalid);
@@ -40,16 +41,19 @@ bool HttpRequest::setMethod(const char *start, const char *end)
     return method_ != kInvalid;
 }
 
+//截取一段内存 → 变成路径字符串 → 存进 path_
 void HttpRequest::setPath(const char *start, const char *end)
 {
     path_.assign(start, end);
 }
 
+//存储从路径中提取出来的路径参数（键值对）
 void HttpRequest::setPathParameters(const std::string &key, const std::string &value)
 {
     pathParameters_[key] = value;
 }
 
+//根据键名查找某个路径参数的值
 std::string HttpRequest::getPathParameters(const std::string &key) const
 {
     auto it = pathParameters_.find(key);
@@ -60,6 +64,7 @@ std::string HttpRequest::getPathParameters(const std::string &key) const
     return "";
 }
 
+//根据键名查找某个查询参数的值
 std::string HttpRequest::getQueryParameters(const std::string &key) const
 {
     auto it = queryParameters_.find(key);
@@ -80,12 +85,17 @@ void HttpRequest::setQueryParameters(const char *start, const char *end)
     // 按 & 分割多个参数
     while ((pos = argumentStr.find('&', prev)) != std::string::npos)
     {
+        //一个完整的 key=value 对（不含 &）
         std::string pair = argumentStr.substr(prev, pos - prev);
+        //在 pair 字符串中查找字符 '='，返回该字符的索引
         std::string::size_type equalPos = pair.find('=');
 
+        //检查是否找到了 '='。只有当 pair 中确实包含等号，才是合法的键值对
         if (equalPos != std::string::npos)
         {
+            //截取 pair 从索引 0 开始、长度为 equalPos 的子串，即等号之前的部分，作为键
             std::string key = pair.substr(0, equalPos);
+            //截取从 equalPos + 1 位置开始直到字符串末尾的子串，即等号之后的部分，作为值
             std::string value = pair.substr(equalPos + 1);
             queryParameters_[key] = value;
         }
@@ -104,6 +114,7 @@ void HttpRequest::setQueryParameters(const char *start, const char *end)
     }
 }
 
+//用于解析一个 HTTP 头部行，并将键值对存入 headers_ 映射中
 void HttpRequest::addHeader(const char *start, const char *colon, const char *end)
 {
     std::string key(start, colon);

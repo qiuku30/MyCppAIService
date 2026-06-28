@@ -42,6 +42,7 @@ public:
             std::unique_ptr<sql::PreparedStatement> stmt(
                 conn_->prepareStatement(sql)
             );
+            //参数绑定递归函数
             bindParams(stmt.get(), 1, std::forward<Args>(args)...);
             return stmt->executeQuery();
         } 

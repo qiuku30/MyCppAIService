@@ -56,6 +56,7 @@ DbConnection::~DbConnection()
     LOG_INFO << "Database connection closed";
 }
 
+//快速判断当前数据库连接是否仍然可用
 bool DbConnection::ping() 
 {
     try 
@@ -72,6 +73,7 @@ bool DbConnection::ping()
     }
 }
 
+//快速判断当前数据库连接是否存活、能否正常执行 SQL
 bool DbConnection::isValid() 
 {
     try 
@@ -81,12 +83,14 @@ bool DbConnection::isValid()
         stmt->execute("SELECT 1");
         return true;
     } 
+
     catch (const sql::SQLException&) 
     {
         return false;
     }
 }
 
+//用于在连接断开或失效后，重新建立与 MySQL 服务器的有效连接
 void DbConnection::reconnect() 
 {
     try 

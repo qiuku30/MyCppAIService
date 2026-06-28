@@ -17,15 +17,18 @@ SessionManager::SessionManager(std::unique_ptr<SessionStorage> storage)
 // 从请求中获取或创建会话，也就是说，如果请求中包含会话ID，则从存储中加载会话，否则创建一个新的会话
 std::shared_ptr<Session> SessionManager::getSession(const HttpRequest& req, HttpResponse* resp)
 {   
+    //从浏览器的 Cookie 里拿 sessionId
     std::string sessionId = getSessionIdFromCookie(req);
     
     std::shared_ptr<Session> session;
 
+    //如果有 sessionId，尝试加载
     if (!sessionId.empty())
     {
         session = storage_->load(sessionId);
     }
 
+    //如果会话不存在 或 已过期 → 创建新会话
     if (!session || session->isExpired())
     {
         sessionId = generateSessionId();

@@ -94,6 +94,7 @@ private:
     }
 
 private:
+    //存储动态路由（通过正则表达式匹配路径）的回调函数式处理器
     struct RouteCallbackObj
     {
         HttpRequest::Method method_;
@@ -103,6 +104,7 @@ private:
             : method_(method), pathRegex_(pathRegex), callback_(callback) {}
     };
 
+    //存储动态路由中使用 对象式处理器 (RouterHandler) 的条目
     struct RouteHandlerObj
     {
         HttpRequest::Method method_;

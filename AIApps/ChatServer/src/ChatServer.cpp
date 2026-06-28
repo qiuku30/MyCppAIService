@@ -34,7 +34,16 @@ ChatServer::ChatServer(int port,
 
 void ChatServer::initialize() {
     std::cout << "ChatServer initialize start  ! " << std::endl;
-	http::MysqlUtil::init("tcp://127.0.0.1:3306", "root", "123456", "ChatHttpServer", 5);
+	const char* db_host = std::getenv("DB_HOST");
+    std::string host = db_host ? db_host : "127.0.0.1";
+    const char* db_user = std::getenv("DB_USER");
+    const char* db_pass = std::getenv("DB_PASSWORD");
+    const char* db_name = std::getenv("DB_NAME");
+    http::MysqlUtil::init("tcp://" + host + ":3306",
+    db_user ? db_user : "root",
+    db_pass ? db_pass : "123456",
+    db_name ? db_name : "ChatHttpServer",
+    5);
 
     initializeSession();
 

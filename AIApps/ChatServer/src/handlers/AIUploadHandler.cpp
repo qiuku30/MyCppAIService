@@ -33,17 +33,18 @@ void AIUploadHandler::handle(const http::HttpRequest& req, http::HttpResponse* r
             fileOperater.resetDefaultFile();
         }
 
+        //分配一个大小等于文件内容的字符缓冲区，然后读取文件全部内容到 buffer
         std::vector<char> buffer(fileOperater.size());
-        fileOperater.readFile(buffer); 
+        fileOperater.readFile(buffer);
         std::string htmlContent(buffer.data(), buffer.size());
 
-
-        size_t headEnd = htmlContent.find("</head>");
-        if (headEnd != std::string::npos)
-        {
-            std::string script = "<script>const userId = '" + std::to_string(userId) + "';</script>";
-            htmlContent.insert(headEnd, script);
-        }
+        // 前端已通过 sessionStorage 管理 userId，不再由后端注入脚本
+        // size_t headEnd = htmlContent.find("</head>");
+        // if (headEnd != std::string::npos)
+        // {
+        //     std::string script = "<script>const userId = '" + std::to_string(userId) + "';</script>";
+        //     htmlContent.insert(headEnd, script);
+        // }
         resp->setStatusLine(req.getVersion(), http::HttpResponse::k200Ok, "OK");
         resp->setCloseConnection(false);
         resp->setContentType("text/html");
@@ -64,6 +65,3 @@ void AIUploadHandler::handle(const http::HttpRequest& req, http::HttpResponse* r
         resp->setBody(failureBody);
     }
 }
-
-
-

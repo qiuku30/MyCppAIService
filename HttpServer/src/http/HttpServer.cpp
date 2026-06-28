@@ -30,23 +30,29 @@ HttpServer::HttpServer(int port,
 // 服务器运行函数
 void HttpServer::start()
 {
+    //打印启动日志
     LOG_WARN << "HttpServer[" << server_.name() << "] starts listening on" << server_.ipPort();
-    server_.start();
-    mainLoop_.loop();
+    server_.start();  //开始监听端口，接收新连接
+    mainLoop_.loop();  //进入事件循环，阻塞当前线程直到服务器停止
 }
 
+//将底层网络事件（连接、数据）与上层 HTTP 处理逻辑对接起来
 void HttpServer::initialize()
 {
     // 设置回调函数
+    //连接回调  bind 把成员函数 HttpServer::onConnection 适配成这个原型
     server_.setConnectionCallback(
-        std::bind(&HttpServer::onConnection, this, std::placeholders::_1));
+        std::bind(&HttpServer::onConnection, this, std::placeholders::_1));  //占位const muduo::net::TcpConnectionPtr&
+
+    //消息回调
     server_.setMessageCallback(
         std::bind(&HttpServer::onMessage, this,
-                  std::placeholders::_1,
-                  std::placeholders::_2,
-                  std::placeholders::_3));
+                  std::placeholders::_1,  //const muduo::net::TcpConnectionPtr&
+                  std::placeholders::_2,  //muduo::net::Buffer*
+                  std::placeholders::_3)); //muduo::Timestamp
 }
 
+//在服务器启动前一次性加载 SSL 证书和私钥，并初始化可供所有加密连接复用的 SSL 上下文，失败则直接终止程序
 void HttpServer::setSslConfig(const ssl::SslConfig& config)
 {
     if (useSSL_)
@@ -64,14 +70,21 @@ void HttpServer::onConnection(const muduo::net::TcpConnectionPtr& conn)
 {
     if (conn->connected())
     {
+        // 如果开启了 HTTPS 加密
         if (useSSL_)
         {
+            //创建一个 SSL 加密连接
             auto sslConn = std::make_unique<ssl::SslConnection>(conn, sslCtx_.get());
+
+            //加密通道收到数据 → 调用 onMessage
             sslConn->setMessageCallback(
                 std::bind(&HttpServer::onMessage, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+            //把这个加密通道存起来，方便以后用
             sslConns_[conn] = std::move(sslConn);
+            //开始 SSL 握手（建立加密通道）
             sslConns_[conn]->startHandshake();
         }
+        //初始化 HTTP 解析上下文
         conn->setContext(HttpContext());
     }
     else 
@@ -142,9 +155,12 @@ void HttpServer::onMessage(const muduo::net::TcpConnectionPtr &conn,
     }
 }
 
+//将一个完整的 HTTP 请求交由业务逻辑处理，生成响应，发送给客户端，并决定是否关闭连接
 void HttpServer::onRequest(const muduo::net::TcpConnectionPtr &conn, const HttpRequest &req)
 {
+    //读取请求头 Connection
     const std::string &connection = req.getHeader("Connection");
+    //判断是否要关闭连接
     bool close = ((connection == "close") ||
                   (req.getVersion() == "HTTP/1.0" && connection != "Keep-Alive"));
     HttpResponse response(close);

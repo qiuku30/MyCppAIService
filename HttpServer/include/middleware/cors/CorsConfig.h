@@ -8,6 +8,7 @@ namespace http
 namespace middleware 
 {
 
+    //CorsConfig = 跨域的 “权限配置表”  专门控制：谁能访问、能干嘛、能带什么信息
 struct CorsConfig 
 {
     std::vector<std::string> allowedOrigins;

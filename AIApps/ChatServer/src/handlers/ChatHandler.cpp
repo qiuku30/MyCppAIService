@@ -1,4 +1,3 @@
-
 #include "../include/handlers/ChatHandler.h"
 
 void ChatHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
@@ -36,16 +35,16 @@ void ChatHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
         }
 
         std::vector<char> buffer(fileOperater.size());
-        fileOperater.readFile(buffer); 
+        fileOperater.readFile(buffer);
         std::string htmlContent(buffer.data(), buffer.size());
 
-
-        size_t headEnd = htmlContent.find("</head>");
-        if (headEnd != std::string::npos)
-        {
-            std::string script = "<script>const userId = '" + std::to_string(userId) + "';</script>";
-            htmlContent.insert(headEnd, script);
-        }
+        // 前端已通过 sessionStorage 管理 userId，不再由后端注入脚本
+        // size_t headEnd = htmlContent.find("</head>");
+        // if (headEnd != std::string::npos)
+        // {
+        //     std::string script = "<script>const userId = '" + std::to_string(userId) + "';</script>";
+        //     htmlContent.insert(headEnd, script);
+        // }
 
         // server_->packageResp(req.getVersion(), HttpResponse::k200Ok, "OK"
         //             , false, "text/html", htmlContent.size(), htmlContent, resp);
@@ -69,5 +68,3 @@ void ChatHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
         resp->setBody(failureBody);
     }
 }
-
-

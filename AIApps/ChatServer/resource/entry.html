@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>卡码AI助手</title>
+<title>秋库AI助手</title>
 <style>
-    /* 全局样式 */
+    /* 全局样式 - 高级渐变背景 */
     body {
         font-family: "Microsoft YaHei", Arial, sans-serif;
         margin: 0;
@@ -14,43 +14,49 @@
         justify-content: center;
         align-items: center;
         height: 100vh;
-        background-color: #f5f5f5;
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
         color: #333;
+        flex-direction: column;
     }
 
     h1.title {
-        font-size: 36px;
+        font-size: 38px;
         font-weight: bold;
         text-align: center;
-        margin-bottom: 30px;
-        background: linear-gradient(to right, #007bff, #00c6ff);
-        -webkit-background-clip: text;
+        margin-bottom: 25px;
+        background: linear-gradient(to right, #4158D0, #8A2BE2);
+        /* 修复后的写法 */
+        -webkit-background-clip: text; /* 兼容旧版浏览器 */
+        background-clip: text; /* 标准写法，兼容性更好 */
         -webkit-text-fill-color: transparent;
+        text-shadow: 0 2px 10px rgba(65,88,208,0.15);
     }
 
     .container {
-        width: 360px;
-        padding: 25px;
+        width: 380px;
+        padding: 35px 30px;
         background: #ffffff;
-        border-radius: 15px;
-        box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+        border-radius: 20px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.08);
         box-sizing: border-box;
         text-align: center;
-        transition: all 0.3s;
+        transition: all 0.3s ease;
+        border: 1px solid rgba(255,255,255,0.5);
     }
 
     .container:hover {
-        box-shadow: 0 12px 25px rgba(0,0,0,0.15);
+        transform: translateY(-5px);
+        box-shadow: 0 15px 35px rgba(0,0,0,0.12);
     }
 
     h2 {
-        font-size: 24px;
-        margin-bottom: 20px;
-        color: #333;
+        font-size: 26px;
+        margin-bottom: 25px;
+        color: #222;
     }
 
     .form-group {
-        margin-bottom: 18px;
+        margin-bottom: 22px;
         text-align: left;
     }
 
@@ -58,74 +64,80 @@
         display: block;
         font-size: 14px;
         color: #555;
-        margin-bottom: 5px;
+        margin-bottom: 8px;
+        font-weight: 500;
     }
 
     .form-group input {
-        width: calc(100% - 20px);
-        padding: 10px;
-        font-size: 14px;
-        border: 1px solid #ccc;
-        border-radius: 8px;
-        background: #f9f9f9;
+        width: 100%;
+        padding: 13px 15px;
+        font-size: 15px;
+        border: 1px solid #e0e0e0;
+        border-radius: 12px;
+        background: #fafafa;
         outline: none;
         transition: all 0.2s;
+        box-sizing: border-box;
     }
 
     .form-group input:focus {
-        border-color: #007bff;
-        box-shadow: 0 0 8px rgba(0,123,255,0.3);
+        border-color: #4158D0;
+        box-shadow: 0 0 0 4px rgba(65,88,208,0.1);
         background: #fff;
     }
 
     .btn {
         width: 100%;
-        padding: 12px;
+        padding: 15px;
         font-size: 16px;
-        background-color: #007bff;
+        background: linear-gradient(to right, #4158D0, #8A2BE2);
         color: #fff;
         border: none;
-        border-radius: 10px;
+        border-radius: 14px;
         cursor: pointer;
         font-weight: bold;
         transition: all 0.3s;
+        margin-top: 10px;
     }
 
     .btn:hover {
-        background-color: #0056b3;
-        transform: scale(1.03);
+        transform: scale(1.02);
+        box-shadow: 0 6px 15px rgba(65,88,208,0.3);
     }
 
     .switch {
-        margin-top: 15px;
+        margin-top: 20px;
         font-size: 14px;
         color: #666;
     }
 
     .switch a {
-        color: #007bff;
+        color: #4158D0;
         text-decoration: none;
         cursor: pointer;
+        font-weight: 500;
     }
 
-    .switch a:hover { text-decoration: underline; }
+    .switch a:hover { 
+        text-decoration: underline; 
+    }
 
     #register-container { display: none; }
 
-    /* 成功提示框 */
     #success-alert {
         position: fixed;
-        top: 20px;
+        top: 30px;
         left: 50%;
         transform: translateX(-50%);
-        background: #007bff;
+        background: linear-gradient(to right, #4158D0, #8A2BE2);
         color: #fff;
-        padding: 12px 25px;
-        border-radius: 10px;
-        box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+        padding: 14px 30px;
+        border-radius: 14px;
+        box-shadow: 0 6px 15px rgba(0,0,0,0.15);
         display: none;
         z-index: 1000;
         font-weight: bold;
+        font-size: 15px;
     }
 </style>
 </head>
@@ -133,9 +145,8 @@
 <div id="success-alert">提示信息</div>
 
 <div>
-    <h1 class="title">卡码AI助手</h1>
+    <h1 class="title">秋库AI助手</h1>
 
-    <!-- 登录 -->
     <div class="container" id="login-container">
         <h2>登录</h2>
         <form id="login-form">
@@ -154,7 +165,6 @@
         </div>
     </div>
 
-    <!-- 注册 -->
     <div class="container" id="register-container">
         <h2>注册</h2>
         <form id="register-form">
@@ -184,7 +194,6 @@ function showAlert(message){
 function showRegister(){ document.getElementById('login-container').style.display='none'; document.getElementById('register-container').style.display='block'; }
 function showLogin(){ document.getElementById('register-container').style.display='none'; document.getElementById('login-container').style.display='block'; }
 
-// 登录
 document.getElementById('login-form').addEventListener('submit', function(e){
     e.preventDefault();
     const username=document.getElementById('login-username').value;
@@ -211,7 +220,6 @@ document.getElementById('login-form').addEventListener('submit', function(e){
     });
 });
 
-// 注册
 document.getElementById('register-form').addEventListener('submit', function(e){
     e.preventDefault();
     const username=document.getElementById('register-username').value;

@@ -10,7 +10,8 @@ namespace http
 bool HttpContext::parseRequest(Buffer *buf, Timestamp receiveTime)
 {
     bool ok = true; // 解析每行请求格式是否正确
-    bool hasMore = true;
+    bool hasMore = true;// 控制循环是否继续（即是否还有数据可处理/需要处理）
+    //读取并解析 HTTP 第一行（请求行）
     while (hasMore)
     {
         if (state_ == kExpectRequestLine)
@@ -35,11 +36,13 @@ bool HttpContext::parseRequest(Buffer *buf, Timestamp receiveTime)
                 hasMore = false;
             }
         }
+        //解析头部行
         else if (state_ == kExpectHeaders)
         {
             const char *crlf = buf->findCRLF();
             if (crlf)
             {
+                //找到一个冒号，且冒号在 CRLF 之前 → 合法的头部行
                 const char *colon = std::find(buf->peek(), crlf, ':');
                 if (colon < crlf)
                 {
@@ -52,10 +55,13 @@ bool HttpContext::parseRequest(Buffer *buf, Timestamp receiveTime)
                     if (request_.method() == HttpRequest::kPost || 
                         request_.method() == HttpRequest::kPut)
                     {
+                        //拿到请求头里的 Content-Length
                         std::string contentLength = request_.getHeader("Content-Length");
                         if (!contentLength.empty())
                         {
+                            //把请求头里读到的「字符串格式的长度数字」，转成真正的整数，存到 request 对象里
                             request_.setContentLength(std::stoi(contentLength));
+                            //如果长度 > 0 → 准备读请求体
                             if (request_.contentLength() > 0)
                             {
                                 state_ = kExpectBody;
@@ -120,25 +126,26 @@ bool HttpContext::processRequestLine(const char *begin, const char *end)
 {
     bool succeed = false;
     const char *start = begin;
-    const char *space = std::find(start, end, ' ');
-    if (space != end && request_.setMethod(start, space))
+    const char *space = std::find(start, end, ' ');//在 [start, end) 区间内查找第一个空格
+
+    if (space != end && request_.setMethod(start, space))   
     {
         start = space + 1;
-        space = std::find(start, end, ' ');
+        space = std::find(start, end, ' ');  //查找第二个空格
         if (space != end)
         {
             const char *argumentStart = std::find(start, space, '?');
             if (argumentStart != space) // 请求带参数
             {
-                request_.setPath(start, argumentStart); // 注意这些返回值边界
-                request_.setQueryParameters(argumentStart + 1, space);
+                request_.setPath(start, argumentStart); // 问号之前是纯粹路径
+                request_.setQueryParameters(argumentStart + 1, space);  //问号之后直到空格之前是查询字符串
             }
             else // 请求不带参数
             {
                 request_.setPath(start, space);
             }
 
-            start = space + 1;
+            start = space + 1;  //移动到版本字符串的起始位置
             succeed = ((end - start == 8) && std::equal(start, end - 1, "HTTP/1."));
             if (succeed)
             {

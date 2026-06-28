@@ -44,8 +44,8 @@ public:
 private:
     bool processRequestLine(const char* begin, const char* end);
 private:
-    HttpRequestParseState state_;
-    HttpRequest           request_;
+    HttpRequestParseState state_;// 解析状态：当前解析到哪一步
+    HttpRequest           request_;// 存储解析结果：最终生成的请求对象
 };
 
 } // namespace http

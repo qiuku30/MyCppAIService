@@ -1,0 +1,40 @@
+FROM huanheart/ai-service-based-on-http-framework-2
+
+# 安装编译工具和所有开发依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake g++ make \
+    libopencv-dev \
+    libmysqlcppconn-dev \
+    librabbitmq-dev \
+    libboost-all-dev \
+    nlohmann-json3-dev \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    # muduo 和 SimpleAmqpClient、ONNX Runtime 可能仍需手动安装，但我们可以直接使用宿主机的（因为它们在容器内重新编译会用到）
+    && rm -rf /var/lib/apt/lists/*
+
+# 手动安装 muduo 网络库
+RUN git clone https://github.com/chenshuo/muduo.git /tmp/muduo && \
+    cd /tmp/muduo && mkdir build && cd build && \
+    cmake .. && make && make install && \
+    rm -rf /tmp/muduo
+
+# 手动安装 SimpleAmqpClient
+RUN git clone https://github.com/alanxz/SimpleAmqpClient.git /tmp/simpleamqp && \
+    cd /tmp/simpleamqp && mkdir build && cd build && \
+    cmake .. && make && make install && \
+    rm -rf /tmp/simpleamqp
+
+# 安装 ONNX Runtime (预编译包)
+RUN wget -qO- https://github.com/microsoft/onnxruntime/releases/download/v1.18.0/onnxruntime-linux-x64-1.18.0.tgz | \
+    tar -xz -C /opt && \
+    cp -r /opt/onnxruntime-linux-x64-1.18.0/include/* /usr/local/include/ && \
+    cp -r /opt/onnxruntime-linux-x64-1.18.0/lib/* /usr/local/lib/ && \
+    ldconfig && \
+    rm -rf /opt/onnxruntime-linux-x64-1.18.0
+
+# 设置工作目录（注意这里路径与挂载点对应）
+WORKDIR /workspace/build
+
+# 默认命令：编译并启动服务（首次启动时会自动编译，之后可手动重启编译）
+CMD ["sh", "-c", "cmake .. && make && ./http_server -p 8117"]
