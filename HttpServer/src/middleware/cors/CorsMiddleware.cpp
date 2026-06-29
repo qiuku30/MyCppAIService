@@ -85,7 +85,7 @@ void CorsMiddleware::addCorsHeaders(HttpResponse& response,
 {
     try 
     {
-        // 【核心】告诉浏览器：允许哪个源（域名）读取本响应
+        // 设置允许跨域访问的来源域名
         response.addHeader("Access-Control-Allow-Origin", origin);
         
         // 如果配置允许携带凭证（Cookie、Authorization 等），则添加对应头
