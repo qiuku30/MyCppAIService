@@ -49,6 +49,7 @@ public:
 	void setThreadNum(int numThreads);
 	void start();
 	void initChatMessage();
+	muduo::net::EventLoop* getLoop() const { return httpServer_.getLoop(); }
 private:
 	friend class ChatLoginHandler;
 	friend class ChatRegisterHandler;

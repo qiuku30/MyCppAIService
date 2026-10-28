@@ -9,6 +9,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
 
+# Gemma.cpp 预编译库路径（可通过环境变量覆盖）
+set(GEMMA_BUILD_DIR "$ENV{GEMMA_BUILD_DIR}")
+if(NOT GEMMA_BUILD_DIR OR GEMMA_BUILD_DIR STREQUAL "")
+    set(GEMMA_BUILD_DIR /home/qiuku/gemma.cpp/build)
+endif()
+set(GEMMA_SOURCE_DIR "$ENV{GEMMA_SOURCE_DIR}")
+if(NOT GEMMA_SOURCE_DIR OR GEMMA_SOURCE_DIR STREQUAL "")
+    set(GEMMA_SOURCE_DIR /home/qiuku/gemma.cpp)
+endif()
+
 # 添加头文件路径
 include_directories(
     ${PROJECT_SOURCE_DIR}
@@ -20,7 +30,12 @@ include_directories(
     ${OPENSSL_INCLUDE_DIR}
     ${CURL_INCLUDE_DIRS}
     /usr/include/opencv4          # OpenCV 头文件路径
-    /usr/local/include            # SimpleAmqpClient & ONNX Runtime
+    /usr/local/include            # ONNX Runtime
+    /home/qiuku/.local/include    # AMQP-CPP (local install)
+    ${GEMMA_SOURCE_DIR}           # Gemma.cpp 根目录
+    ${GEMMA_BUILD_DIR}/_deps/sentencepiece-src/src  # SentencePiece
+    ${GEMMA_BUILD_DIR}/_deps/highway-src             # Highway
+    ${GEMMA_BUILD_DIR}/_deps/json-src/include        # nlohmann/json (gemma 依赖)
 )
 
 # 查找必要的库
@@ -45,6 +60,19 @@ file(GLOB_RECURSE GOMOKU_SERVER_SRC
 
 # 主程序文件
 set(MAIN_SRC "${PROJECT_SOURCE_DIR}/AIApps/ChatServer/src/main.cpp")
+
+# Gemma.cpp 预编译静态库（IMPORTED 目标）
+add_library(libgemma STATIC IMPORTED GLOBAL)
+set_target_properties(libgemma PROPERTIES IMPORTED_LOCATION ${GEMMA_BUILD_DIR}/libgemma.a)
+
+add_library(hwy STATIC IMPORTED GLOBAL)
+set_target_properties(hwy PROPERTIES IMPORTED_LOCATION ${GEMMA_BUILD_DIR}/_deps/highway-build/libhwy.a)
+
+add_library(hwy_contrib STATIC IMPORTED GLOBAL)
+set_target_properties(hwy_contrib PROPERTIES IMPORTED_LOCATION ${GEMMA_BUILD_DIR}/_deps/highway-build/libhwy_contrib.a)
+
+add_library(sentencepiece-static STATIC IMPORTED GLOBAL)
+set_target_properties(sentencepiece-static PROPERTIES IMPORTED_LOCATION ${GEMMA_BUILD_DIR}/_deps/sentencepiece-build/src/libsentencepiece.a)
 
 # 添加可执行文件
 add_executable(http_server
@@ -73,12 +101,17 @@ target_link_libraries(http_server
 
     ${ONNXRUNTIME_LIBRARY}        # 自动查找的 ONNX Runtime 库
 
-    SimpleAmqpClient
-    rabbitmq
+    /home/qiuku/.local/lib/libamqpcpp.a   # AMQP-CPP
+
+    # Gemma.cpp 本地推理引擎（顺序重要：libgemma → hwy → hwy_contrib → sentencepiece）
+    libgemma
+    hwy
+    hwy_contrib
+    sentencepiece-static
 )
 
 # 如果库不在默认路径，添加链接目录
-link_directories(/usr/local/lib)
+link_directories(/usr/local/lib /home/qiuku/.local/lib)
 
 # 打印调试信息
 message(STATUS "Include directories:")
