@@ -1,2 +1,13 @@
 build*/
 
+# 编译索引（由 cmake 生成，勿提交）
+compile_commands.json
+
+# 编辑器配置
+.vscode/
+
+# 运行时日志
+failed_sql.log
+
+# 真实密钥（只提交 .env.example 模板）
+.env

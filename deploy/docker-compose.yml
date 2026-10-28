@@ -42,6 +42,8 @@ services:
     restart: always
     volumes:
       - ..:/workspace
+      - ${GEMMA_BUILD_DIR:-/home/qiuku/gemma.cpp/build}:/opt/gemma:ro
+      - ${GEMMA_SOURCE_DIR:-/home/qiuku/gemma.cpp}:/opt/gemma-src:ro
     environment:
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
       KNOWLEDGE_BASE_ID: ${KNOWLEDGE_BASE_ID}
@@ -58,6 +60,10 @@ services:
       RABBITMQ_USER: ${RABBITMQ_USER}
       RABBITMQ_PASS: ${RABBITMQ_PASS}
       LD_LIBRARY_PATH: /usr/local/lib
+      GEMMA_MODEL_PATH: ${GEMMA_MODEL_PATH:-/opt/gemma/2.0-2b-it-sfp.sbs}
+      GEMMA_TOKENIZER_PATH: ${GEMMA_TOKENIZER_PATH:-/opt/gemma/tokenizer.spm}
+      GEMMA_BUILD_DIR: /opt/gemma
+      GEMMA_SOURCE_DIR: /opt/gemma-src
     ports:
       - "8116-8117:8116-8117"
     depends_on:
