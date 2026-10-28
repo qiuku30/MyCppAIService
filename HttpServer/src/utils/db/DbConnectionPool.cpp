@@ -52,59 +52,60 @@ DbConnectionPool::~DbConnectionPool()
     LOG_INFO << "Database connection pool destroyed";
 }
 
-// 修改获取连接的函数
-std::shared_ptr<DbConnection> DbConnectionPool::getConnection() 
+// 获取连接：30 秒超时 + 死连接自动剔除替换
+std::shared_ptr<DbConnection> DbConnectionPool::getConnection()
 {
     std::shared_ptr<DbConnection> conn;
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        
-        while (connections_.empty()) 
+
+        // 修复⑥：30 秒超时，避免请求线程永久阻塞
+        while (connections_.empty())
         {
-            if (!initialized_) 
+            if (!initialized_)
             {
                 throw DbException("Connection pool not initialized");
             }
             LOG_INFO << "Waiting for available connection...";
-            cv_.wait(lock);
+            if (cv_.wait_for(lock, std::chrono::seconds(30)) == std::cv_status::timeout)
+            {
+                throw DbException("Connection pool exhausted: timeout after 30s");
+            }
         }
-        
+
         conn = connections_.front();
         connections_.pop();
-    } // 释放锁
-    
-    try 
+    }
+
+    try
     {
-        // 在锁外检查连接
-        if (!conn->ping()) 
+        // 修复⑤：死连接不可恢复时，用新连接替换，不再塞回池中
+        if (!conn->ping())
         {
             LOG_WARN << "Connection lost, attempting to reconnect...";
-            conn->reconnect();
+            try
+            {
+                conn->reconnect();
+            }
+            catch (const std::exception& e)
+            {
+                LOG_ERROR << "Reconnect failed, replacing with new connection: " << e.what();
+                conn = createConnection();  // 创建全新连接替代死连接
+            }
         }
-        
-        //构造“自动归还”的智能指针并返回
-        // 返回一个共享指针，指向数据库连接。
-        // 但这里并不是直接返回从队列中取出的 conn，而是构造了一个新的 shared_ptr，
-        // 并为它指定了一个自定义的删除器。目的：当业务代码不再使用该连接时，
-        // 连接不会真的被销毁，而是自动归还到连接池中。
+
         return std::shared_ptr<DbConnection>(
-            conn.get(),                     // 被管理的原始指针，指向同一个 DbConnection 对象
-            [this, conn](DbConnection*) {   // 自定义删除器（lambda 表达式）
-                                            // 参数 DbConnection* 没有名字，因为函数体内不需要它
-                                            // （我们要归还的是 conn 这个 shared_ptr，不是原始指针）
-                std::lock_guard<std::mutex> lock(mutex_); // 加锁，保证线程安全
-                connections_.push(conn);                  // 将连接放回连接池队列
-                cv_.notify_one();                         // 唤醒一个正在等待连接的线程
-                });
-    } 
-    catch (const std::exception& e) 
+            conn.get(),
+            [this, conn](DbConnection*) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                connections_.push(conn);
+                cv_.notify_one();
+            });
+    }
+    catch (const std::exception& e)
     {
+        // 新连接创建也失败 → 彻底失败，不再把死连接塞回池
         LOG_ERROR << "Failed to get connection: " << e.what();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            connections_.push(conn);
-            cv_.notify_one();
-        }
         throw;
     }
 }

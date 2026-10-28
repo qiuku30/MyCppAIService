@@ -67,7 +67,7 @@ bool Router::route(const HttpRequest &req, HttpResponse *resp)
             HttpRequest newReq(req); // 因为这里需要用这一次所以是可以改的
             extractPathParameters(match, newReq);
 
-            callback(req, resp);
+            callback(newReq, resp);  // 修复：传注入了路径参数的 newReq
             return true;
         }
     }

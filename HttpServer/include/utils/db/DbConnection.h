@@ -36,37 +36,38 @@ public:
     sql::ResultSet* executeQuery(const std::string& sql, Args&&... args)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        try 
+        try
         {
-            // 直接创建新的预处理语句，不使用缓存
+            // prepareStatement 返回派生类指针，不可用 make_unique（抽象类）
             std::unique_ptr<sql::PreparedStatement> stmt(
-                conn_->prepareStatement(sql)
-            );
-            //参数绑定递归函数
+                conn_->prepareStatement(sql));
             bindParams(stmt.get(), 1, std::forward<Args>(args)...);
-            return stmt->executeQuery();
-        } 
-        catch (const sql::SQLException& e) 
+            sql::ResultSet* res = stmt->executeQuery();
+            // 关键：保持 PreparedStatement 存活，否则返回的 ResultSet* 会悬空
+            lastStmt_ = std::move(stmt);
+            return res;
+        }
+        catch (const sql::SQLException& e)
         {
             LOG_ERROR << "Query failed: " << e.what() << ", SQL: " << sql;
             throw DbException(e.what());
         }
     }
-    
+
     template<typename... Args>
     int executeUpdate(const std::string& sql, Args&&... args)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        try 
+        try
         {
-            // 直接创建新的预处理语句，不使用缓存
             std::unique_ptr<sql::PreparedStatement> stmt(
-                conn_->prepareStatement(sql)
-            );
+                conn_->prepareStatement(sql));
             bindParams(stmt.get(), 1, std::forward<Args>(args)...);
-            return stmt->executeUpdate();
-        } 
-        catch (const sql::SQLException& e) 
+            int ret = stmt->executeUpdate();
+            lastStmt_ = std::move(stmt);
+            return ret;
+        }
+        catch (const sql::SQLException& e)
         {
             LOG_ERROR << "Update failed: " << e.what() << ", SQL: " << sql;
             throw DbException(e.what());
@@ -103,6 +104,7 @@ private:
     std::string                      password_;
     std::string                      database_;
     std::mutex                       mutex_;
+    std::unique_ptr<sql::PreparedStatement> lastStmt_; // 保持 ResultSet 存活
 };
 
 } // namespace db

@@ -59,8 +59,18 @@ bool HttpContext::parseRequest(Buffer *buf, Timestamp receiveTime)
                         std::string contentLength = request_.getHeader("Content-Length");
                         if (!contentLength.empty())
                         {
-                            //把请求头里读到的「字符串格式的长度数字」，转成真正的整数，存到 request 对象里
-                            request_.setContentLength(std::stoi(contentLength));
+                            // 安全转换：捕获 stoi 异常（非数字/溢出）
+                            uint64_t len = 0;
+                            try {
+                                len = std::stoull(contentLength);
+                            } catch (const std::exception&) {
+                                ok = false; hasMore = false; break;
+                            }
+                            // Body 大小上限 10MB，防止内存耗尽
+                            if (len > 10 * 1024 * 1024) {
+                                ok = false; hasMore = false; break;
+                            }
+                            request_.setContentLength(len);
                             //如果长度 > 0 → 准备读请求体
                             if (request_.contentLength() > 0)
                             {

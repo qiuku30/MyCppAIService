@@ -57,7 +57,34 @@ std::string AIConfig::buildPrompt(const std::string& userInput) const {
 AIToolCall AIConfig::parseAIResponse(const std::string& response) const {
     AIToolCall result;
     try {
-        json j = json::parse(response);
+        // 预处理：strip LLM 可能包裹的 markdown 代码块标记
+        std::string cleaned = response;
+        // 去除首尾空白
+        size_t first = cleaned.find_first_not_of(" \t\n\r");
+        size_t last  = cleaned.find_last_not_of(" \t\n\r");
+        if (first != std::string::npos && last != std::string::npos) {
+            cleaned = cleaned.substr(first, last - first + 1);
+        }
+        // 去掉可能的 markdown ```json ... ``` 包裹
+        if (cleaned.size() >= 7 && cleaned.substr(0, 7) == "```json") {
+            cleaned = cleaned.substr(7);
+            if (cleaned.size() >= 3 && cleaned.substr(cleaned.size() - 3) == "```") {
+                cleaned = cleaned.substr(0, cleaned.size() - 3);
+            }
+        } else if (cleaned.size() >= 3 && cleaned.substr(0, 3) == "```") {
+            cleaned = cleaned.substr(3);
+            if (cleaned.size() >= 3 && cleaned.substr(cleaned.size() - 3) == "```") {
+                cleaned = cleaned.substr(0, cleaned.size() - 3);
+            }
+        }
+        // 再次 trim
+        first = cleaned.find_first_not_of(" \t\n\r");
+        last  = cleaned.find_last_not_of(" \t\n\r");
+        if (first != std::string::npos && last != std::string::npos) {
+            cleaned = cleaned.substr(first, last - first + 1);
+        }
+
+        json j = json::parse(cleaned);
         if (j.contains("tool") && j["tool"].is_string()) {
             result.toolName = j["tool"].get<std::string>();
             if (j.contains("args") && j["args"].is_object()) {
