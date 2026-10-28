@@ -1,6 +1,32 @@
 #include"../include/AIUtil/AIStrategy.h"
 #include"../include/AIUtil/AIFactory.h"
 
+// ========== AIStrategy 默认流式接口实现 ==========
+
+json AIStrategy::buildStreamRequest(
+    const std::vector<std::pair<std::string, long long>>& messages) const {
+    json req = buildRequest(messages);
+    req["stream"] = true;
+    return req;
+}
+
+bool AIStrategy::parseStreamChunk(const std::string& sseData,
+                                   std::string& tokenText) const {
+    if (sseData.empty() || sseData == "[DONE]") return false;
+    try {
+        auto j = json::parse(sseData);
+        if (j.contains("choices") && !j["choices"].empty() &&
+            j["choices"][0].contains("delta") &&
+            j["choices"][0]["delta"].contains("content")) {
+            tokenText = j["choices"][0]["delta"]["content"];
+            return !tokenText.empty();
+        }
+    } catch (...) {}
+    return false;
+}
+
+// ========== 云端策略实现 ==========
+
 std::string AliyunStrategy::getApiUrl() const {
     return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 }
@@ -172,7 +198,43 @@ std::string AliyunMcpStrategy::parseResponse(const json& response) const {
 }
 
 
+// ========== GemmaStrategy 本地推理 ==========
+
+std::string GemmaStrategy::getApiUrl() const {
+    return "local://gemma";
+}
+
+std::string GemmaStrategy::getApiKey() const {
+    return "";
+}
+
+std::string GemmaStrategy::getModel() const {
+    return "gemma-2-2b-it";
+}
+
+json GemmaStrategy::buildRequest(
+    const std::vector<std::pair<std::string, long long>>& messages) const {
+    json j;
+    j["model"] = getModel();
+    json msgArray = json::array();
+    for (size_t i = 0; i < messages.size(); ++i) {
+        json msg;
+        msg["role"] = (i % 2 == 0) ? "user" : "assistant";
+        msg["content"] = messages[i].first;
+        msgArray.push_back(msg);
+    }
+    j["messages"] = msgArray;
+    return j;
+}
+
+std::string GemmaStrategy::parseResponse(const json& response) const {
+    return response.value("text", "");
+}
+
+// ========== 策略自动注册 ==========
+
 static StrategyRegister<AliyunStrategy> regAliyun("1");
 static StrategyRegister<DouBaoStrategy> regDoubao("2");
 static StrategyRegister<AliyunRAGStrategy> regAliyunRag("3");
 static StrategyRegister<AliyunMcpStrategy> regAliyunMcp("4");
+static StrategyRegister<GemmaStrategy> regGemma("5");

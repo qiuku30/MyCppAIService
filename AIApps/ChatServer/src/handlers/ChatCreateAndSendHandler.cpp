@@ -1,4 +1,6 @@
 #include "../include/handlers/ChatCreateAndSendHandler.h"
+#include <muduo/net/Buffer.h>
+#include <thread>
 
 
 void ChatCreateAndSendHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
@@ -28,14 +30,14 @@ void ChatCreateAndSendHandler::handle(const http::HttpRequest& req, http::HttpRe
 
         std::string userQuestion;
         std::string modelType;
+        bool stream = false;
 
         auto body = req.getBody();
         if (!body.empty()) {
             auto j = json::parse(body);
             if (j.contains("question")) userQuestion = j["question"];
-
-
             modelType = j.contains("modelType") ? j["modelType"].get<std::string>() : "1";
+            stream = j.value("stream", false);
         }
 
         AISessionIdGenerator generator;
@@ -51,7 +53,7 @@ void ChatCreateAndSendHandler::handle(const http::HttpRequest& req, http::HttpRe
 
             if (userSessions.find(sessionId) == userSessions.end()) {
 
-                userSessions.emplace( 
+                userSessions.emplace(
                     sessionId,
                     std::make_shared<AIHelper>()
                 );
@@ -61,12 +63,55 @@ void ChatCreateAndSendHandler::handle(const http::HttpRequest& req, http::HttpRe
 
         }
 
+        // === SSE 流式路径 ===
+        if (stream) {
+            resp->setStatusLine(req.getVersion(), http::HttpResponse::k200Ok, "OK");
+            resp->setupSSEHeaders();
+
+            auto conn = req.getConnection();
+            {
+                muduo::net::Buffer headerBuf;
+                resp->appendToBuffer(&headerBuf);
+                conn->send(&headerBuf);
+            }
+
+            // 先发送 sessionId 事件
+            conn->send("data: " + json{{"sessionId", sessionId}}.dump() + "\n\n");
+
+            std::thread([AIHelperPtr, userId, username = std::move(username),
+                         sessionId = std::move(sessionId),
+                         userQuestion = std::move(userQuestion),
+                         modelType = std::move(modelType), conn]() {
+                AIHelperPtr->chatStream(userId, username, sessionId,
+                    userQuestion, modelType,
+                    [conn](const std::string& token) {
+                        json event = {
+                            {"choices", {{{"delta", {{"content", token}}}, {"index", 0}}}}
+                        };
+                        conn->send("data: " + event.dump() + "\n\n");
+                    },
+                    [conn](const std::string& /*full_answer*/) {
+                        conn->send("data: [DONE]\n\n");
+                        conn->shutdown();
+                    },
+                    [conn](const std::string& err) {
+                        json errEvent = {{"error", err}};
+                        conn->send("data: " + errEvent.dump() + "\n\n");
+                        conn->send("data: [DONE]\n\n");
+                        conn->shutdown();
+                    });
+            }).detach();
+
+            return;
+        }
+
+        // === 非流式路径（原有行为） ===
         std::string aiInformation=AIHelperPtr->chat(userId, username,sessionId, userQuestion, modelType);
         json successResp;
         successResp["success"] = true;
         successResp["Information"] = aiInformation;
         successResp["sessionId"] = sessionId;
-        
+
         std::string successBody = successResp.dump(4);
 
         resp->setStatusLine(req.getVersion(), http::HttpResponse::k200Ok, "OK");

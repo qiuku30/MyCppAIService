@@ -1,4 +1,3 @@
-cat > ~/ai-project/AIApps/ChatServer/resource/AI.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -129,6 +128,7 @@ cat > ~/ai-project/AIApps/ChatServer/resource/AI.html << 'EOF'
                 <option value="2">豆包</option>
                 <option value="3">百炼RAG</option>
                 <option value="4">阿里百炼MCP</option>
+                <option value="5">Gemma 2B (本地)</option>
             </select>
             <button id="bgBtn">🎨 换背景</button>
             <button id="resetBgBtn">↺ 恢复默认</button>
@@ -261,6 +261,80 @@ cat > ~/ai-project/AIApps/ChatServer/resource/AI.html << 'EOF'
             clearMessages();
         });
 
+        // SSE 流式聊天：解析 data: 行，逐 token 追加到同一个消息气泡
+        async function streamChat(url, body) {
+            const response = await fetch(url, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...body, stream: true }),
+                credentials: 'include'
+            });
+            if (!response.ok) {
+                const err = await response.json().catch(() => ({}));
+                throw new Error(err.message || 'HTTP ' + response.status);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let msgDiv = null;
+            let fullContent = '';
+            let newSessionId = null;
+
+            // 先创建一个空的 AI 消息气泡，后续逐 token 填充
+            function ensureMsgDiv() {
+                if (!msgDiv) {
+                    msgDiv = document.createElement('div');
+                    msgDiv.classList.add('message', 'assistant');
+                    msgDiv.innerHTML = '<div style="display:flex; align-items:center; gap:10px;"><div style="flex:1;"><b>AI:</b><br><span class="stream-content"></span></div></div>';
+                    chatContainer.appendChild(msgDiv);
+                }
+                return msgDiv.querySelector('.stream-content');
+            }
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                // 按 \n\n 分割 SSE 事件
+                let idx;
+                while ((idx = buffer.indexOf('\n\n')) !== -1) {
+                    const event = buffer.substring(0, idx);
+                    buffer = buffer.substring(idx + 2);
+
+                    for (const line of event.split('\n')) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = line.substring(6);
+
+                        // 检查 sessionId 事件（新会话）
+                        try {
+                            const j = JSON.parse(data);
+                            if (j.sessionId) {
+                                newSessionId = j.sessionId;
+                                continue;
+                            }
+                        } catch (_) {}
+
+                        if (data === '[DONE]') continue;
+
+                        // 解析 token delta
+                        try {
+                            const j = JSON.parse(data);
+                            const token = j.choices?.[0]?.delta?.content || '';
+                            if (token) {
+                                fullContent += token;
+                                const span = ensureMsgDiv();
+                                const safeHtml = DOMPurify.sanitize(marked.parse(fullContent));
+                                span.innerHTML = safeHtml;
+                                chatContainer.scrollTop = chatContainer.scrollHeight;
+                            }
+                        } catch (_) {}
+                    }
+                }
+            }
+            return { fullContent, newSessionId, msgDiv };
+        }
+
         chatForm.addEventListener('submit', async e => {
             e.preventDefault();
             const question = questionInput.value.trim();
@@ -268,51 +342,50 @@ cat > ~/ai-project/AIApps/ChatServer/resource/AI.html << 'EOF'
             sendBtn.disabled = true; sendBtn.textContent = '发送中...';
             appendMessage('user', question);
 
-            // 智能兜底：如果没有有效会话，自动按新会话处理
             if (!currentSessionId || currentSessionId === 'temp' || !sessions[currentSessionId]) {
                 tempSession = true;
             }
 
             try {
                 if (tempSession) {
-                    const response = await fetch('/chat/send-new-session', {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ question, modelType: modelTypeSelect.value }),
-                        credentials: 'include'
-                    });
-                    const data = await response.json();
-                    if (data.success) {
-                        const sessionId = String(data.sessionId);
-                        sessions[sessionId] = {
-                            name: '新会话',
-                            messages: [{ role: 'user', content: question }, { role: 'assistant', content: data.Information }]
-                        };
-                        currentSessionId = sessionId;
-                        tempSession = false;
+                    const { fullContent, newSessionId, msgDiv } = await streamChat(
+                        '/chat/send-new-session',
+                        { question, modelType: modelTypeSelect.value }
+                    );
+                    if (newSessionId) {
+                        const sid = String(newSessionId);
+                        sessions[sid] = { name: '新会话', messages: [
+                            { role: 'user', content: question },
+                            { role: 'assistant', content: fullContent }
+                        ]};
+                        currentSessionId = sid; tempSession = false;
                         renderSessionList();
-                        appendMessage('assistant', data.Information);
-                    } else {
-                        appendMessage('assistant', '[错误] ' + (data.message || '未知错误'));
+                    }
+                    // 给流式气泡加 TTS 按钮
+                    if (msgDiv && fullContent) {
+                        const ttsBtn = document.createElement('button');
+                        ttsBtn.className = 'tts-btn'; ttsBtn.textContent = '🔊';
+                        ttsBtn.onclick = () => playTTS(fullContent);
+                        msgDiv.querySelector('div').appendChild(ttsBtn);
                     }
                 } else {
                     if (!sessions[currentSessionId]) sessions[currentSessionId] = { name: `会话 ${currentSessionId}`, messages: [] };
                     sessions[currentSessionId].messages.push({ role: 'user', content: question });
-                    const response = await fetch('/chat/send', {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ question, modelType: modelTypeSelect.value, sessionId: currentSessionId }),
-                        credentials: 'include'
-                    });
-                    const data = await response.json();
-                    if (data.success) {
-                        appendMessage('assistant', data.Information);
-                        sessions[currentSessionId].messages.push({ role: 'assistant', content: data.Information });
-                    } else {
-                        appendMessage('assistant', '[错误] ' + (data.message || '未知错误'));
+                    const { fullContent, msgDiv } = await streamChat(
+                        '/chat/send',
+                        { question, modelType: modelTypeSelect.value, sessionId: currentSessionId }
+                    );
+                    if (msgDiv && fullContent) {
+                        const ttsBtn = document.createElement('button');
+                        ttsBtn.className = 'tts-btn'; ttsBtn.textContent = '🔊';
+                        ttsBtn.onclick = () => playTTS(fullContent);
+                        msgDiv.querySelector('div').appendChild(ttsBtn);
                     }
+                    sessions[currentSessionId].messages.push({ role: 'assistant', content: fullContent });
                 }
             } catch (err) {
                 console.error(err);
-                appendMessage('assistant', '[错误] 无法连接到服务器，请检查网络或后端服务');
+                appendMessage('assistant', '[错误] ' + (err.message || '无法连接到服务器'));
             } finally {
                 sendBtn.disabled = false; sendBtn.textContent = '发送'; questionInput.value = '';
             }
@@ -359,4 +432,3 @@ cat > ~/ai-project/AIApps/ChatServer/resource/AI.html << 'EOF'
     </script>
 </body>
 </html>
-EOF

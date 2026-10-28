@@ -29,6 +29,16 @@ public:
 
     virtual std::string parseResponse(const json& response) const = 0;
 
+    // 是否本地推理模型（不走 HTTP curl，走 GemmaInferencePool）
+    virtual bool isLocal() const { return false; }
+
+    // 构建流式请求（cloud APIs: 添加 "stream": true）
+    virtual json buildStreamRequest(const std::vector<std::pair<std::string, long long>>& messages) const;
+
+    // 解析 SSE data 行中的 delta content（OpenAI 兼容格式）
+    // 返回 true 表示成功提取到 token_text
+    virtual bool parseStreamChunk(const std::string& sseData, std::string& tokenText) const;
+
     bool isMCPModel = false;
 
 };
@@ -114,6 +124,22 @@ public:
 
 private:
     std::string apiKey_;
+};
+
+// Gemma 本地推理策略 — 不走 HTTP，通过 GemmaInferencePool 执行
+class GemmaStrategy : public AIStrategy {
+
+public:
+    GemmaStrategy() { isMCPModel = false; }
+
+    std::string getApiUrl() const override;
+    std::string getApiKey() const override;
+    std::string getModel() const override;
+
+    json buildRequest(const std::vector<std::pair<std::string, long long>>& messages) const override;
+    std::string parseResponse(const json& response) const override;
+
+    bool isLocal() const override { return true; }
 };
 
 

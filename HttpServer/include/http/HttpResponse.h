@@ -54,9 +54,23 @@ public:
     { headers_[key] = value; }
     
     void setBody(const std::string& body)
-    { 
+    {
         body_ = body;
         // body_ += "\0";
+    }
+
+    // 流式响应标记：设为 true 时 onRequest() 跳过序列化和 send()
+    void setStreaming(bool v) { streaming_ = v; }
+    bool isStreaming() const { return streaming_; }
+
+    // SSE 流式响应快捷设置：Content-Type + Cache-Control + keep-alive
+    void setupSSEHeaders()
+    {
+        setContentType("text/event-stream");
+        addHeader("Cache-Control", "no-cache");
+        addHeader("Connection", "keep-alive");
+        setCloseConnection(false);
+        setStreaming(true);
     }
 
     void setStatusLine(const std::string& version,
@@ -74,6 +88,7 @@ private:
     std::map<std::string, std::string> headers_;
     std::string                        body_;
     bool                               isFile_;
+    bool                               streaming_ = false;  // SSE 流式标记
 };
 
 } // namespace http

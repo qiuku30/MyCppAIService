@@ -33,8 +33,10 @@ void HttpResponse::appendToBuffer(muduo::net::Buffer* outputBuf) const
         outputBuf->append("\r\n");
     }
     outputBuf->append("\r\n");
-    
-    outputBuf->append(body_);
+
+    if (!streaming_) {
+        outputBuf->append(body_);
+    }
 }
 
 void HttpResponse::setStatusLine(const std::string& version,

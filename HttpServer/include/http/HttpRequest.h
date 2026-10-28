@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include <muduo/base/Timestamp.h>
+#include <muduo/net/TcpConnection.h>
 
 namespace http
 {
@@ -74,6 +75,10 @@ public:
 
     void swap(HttpRequest& that);
 
+    // 流式响应支持：注入 TcpConnection 供 Handler 发送 SSE 数据
+    void setConnection(const muduo::net::TcpConnectionPtr& conn) { connection_ = conn; }
+    muduo::net::TcpConnectionPtr getConnection() const { return connection_; }
+
 private:
     Method                                       method_; // 请求方法
     std::string                                  version_; // http版本
@@ -84,6 +89,7 @@ private:
     std::map<std::string, std::string>           headers_; // 请求头
     std::string                                  content_; // 请求体
     uint64_t                                     contentLength_ { 0 }; // 请求体长度
-};  
+    muduo::net::TcpConnectionPtr                 connection_;          // 流式 SSE 用
+};
 
 } // namespace http

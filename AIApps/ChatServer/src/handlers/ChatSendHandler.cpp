@@ -1,4 +1,6 @@
 #include "../include/handlers/ChatSendHandler.h"
+#include <muduo/net/Buffer.h>
+#include <thread>
 
 
 void ChatSendHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
@@ -29,14 +31,15 @@ void ChatSendHandler::handle(const http::HttpRequest& req, http::HttpResponse* r
         std::string userQuestion;
         std::string modelType;
         std::string sessionId;
+        bool stream = false;
 
         auto body = req.getBody();
         if (!body.empty()) {
             auto j = json::parse(body);
             if (j.contains("question")) userQuestion = j["question"];
             if (j.contains("sessionId")) sessionId = j["sessionId"];
-
             modelType = j.contains("modelType") ? j["modelType"].get<std::string>() : "1";
+            stream = j.value("stream", false);
         }
 
 
@@ -48,15 +51,59 @@ void ChatSendHandler::handle(const http::HttpRequest& req, http::HttpResponse* r
 
             if (userSessions.find(sessionId) == userSessions.end()) {
 
-                userSessions.emplace( 
+                userSessions.emplace(
                     sessionId,
                     std::make_shared<AIHelper>()
                 );
             }
             AIHelperPtr= userSessions[sessionId];
         }
-        
 
+        // === SSE 流式路径 ===
+        if (stream) {
+            resp->setStatusLine(req.getVersion(), http::HttpResponse::k200Ok, "OK");
+            resp->setupSSEHeaders();
+
+            auto conn = req.getConnection();
+            // 先发送 HTTP 头
+            {
+                muduo::net::Buffer headerBuf;
+                resp->appendToBuffer(&headerBuf);
+                conn->send(&headerBuf);
+            }
+
+            // 在独立线程中执行推理，避免阻塞 muduo IO
+            std::thread([AIHelperPtr, userId, username = std::move(username),
+                         sessionId = std::move(sessionId),
+                         userQuestion = std::move(userQuestion),
+                         modelType = std::move(modelType), conn]() {
+                AIHelperPtr->chatStream(userId, username, sessionId,
+                    userQuestion, modelType,
+                    // on_token: SSE 逐 token 发送
+                    [conn](const std::string& token) {
+                        json event = {
+                            {"choices", {{{"delta", {{"content", token}}}, {"index", 0}}}}
+                        };
+                        conn->send("data: " + event.dump() + "\n\n");
+                    },
+                    // on_done: 发送完成标记
+                    [conn](const std::string& /*full_answer*/) {
+                        conn->send("data: [DONE]\n\n");
+                        conn->shutdown();
+                    },
+                    // on_error: 发送错误事件
+                    [conn](const std::string& err) {
+                        json errEvent = {{"error", err}};
+                        conn->send("data: " + errEvent.dump() + "\n\n");
+                        conn->send("data: [DONE]\n\n");
+                        conn->shutdown();
+                    });
+            }).detach();
+
+            return;  // Handler 返回，onRequest 跳过序列化（streaming=true）
+        }
+
+        // === 非流式路径（原有行为） ===
         std::string aiInformation=AIHelperPtr->chat(userId, username,sessionId, userQuestion, modelType);
         json successResp;
         successResp["success"] = true;

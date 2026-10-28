@@ -165,8 +165,17 @@ void HttpServer::onRequest(const muduo::net::TcpConnectionPtr &conn, const HttpR
                   (req.getVersion() == "HTTP/1.0" && connection != "Keep-Alive"));
     HttpResponse response(close);
 
+    // 注入 TcpConnection 供 Handler 流式发送 SSE 数据
+    const_cast<HttpRequest&>(req).setConnection(conn);
+
     // 根据请求报文信息来封装响应报文对象
     httpCallback_(req, &response); // 执行onHttpCallback函数
+
+    // 流式响应：Handler 已接管连接，跳过序列化和 send
+    if (response.isStreaming()) {
+        LOG_INFO << "Streaming response, handler took over connection";
+        return;
+    }
 
     // 可以给response设置一个成员，判断是否请求的是文件，如果是文件设置为true，并且存在文件位置在这里send出去。
     muduo::net::Buffer buf;

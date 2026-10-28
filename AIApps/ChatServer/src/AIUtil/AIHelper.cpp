@@ -1,7 +1,9 @@
 #include"../include/AIUtil/AIHelper.h"
 #include"../include/AIUtil/MQManager.h"
+#include"../include/AIUtil/GemmaInferencePool.h"
 #include <stdexcept>
 #include<chrono>
+#include <muduo/base/Logging.h>
 
 AIHelper::AIHelper() {
     strategy = StrategyFactory::instance().create("1");
@@ -27,7 +29,20 @@ void AIHelper::restoreMessage(const std::string& userInput, long long ms) {
 
 std::string AIHelper::chat(int userId, std::string userName, std::string sessionId,
                            std::string userQuestion, std::string modelType) {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
     setStrategy(StrategyFactory::instance().create(modelType));
+
+    // 本地模型：走 GemmaInferencePool
+    if (strategy->isLocal()) {
+        if (!GemmaInferencePool::instance().isLoaded()) {
+            return "[Error] Gemma model not loaded";
+        }
+        addMessage(userId, userName, true, userQuestion, sessionId);
+        std::string answer = GemmaInferencePool::instance().generateSync(
+            sessionId, userQuestion);
+        addMessage(userId, userName, false, answer, sessionId);
+        return answer.empty() ? "[Error] Empty response" : answer;
+    }
 
     // 非 MCP 模型：直接对话
     if (false == strategy->isMCPModel) {
@@ -46,13 +61,11 @@ std::string AIHelper::chat(int userId, std::string userName, std::string session
     std::string tempUserQuestion = config.buildPrompt(userQuestion);
     std::cout << "tempUserQuestion is " << tempUserQuestion << std::endl;
 
-    messages.push_back({tempUserQuestion, 0});
+    ScopedMessage phase1Guard(messages, tempUserQuestion);  // RAII: 离开作用域自动 pop
 
     json firstReq = strategy->buildRequest(this->messages);
     json firstResp = executeCurl(firstReq);
     std::string aiResult = strategy->parseResponse(firstResp);
-
-    messages.pop_back();  // 清理系统提示词，不污染历史
 
     std::cout << "aiResult is " << aiResult << std::endl;
 
@@ -86,19 +99,118 @@ std::string AIHelper::chat(int userId, std::string userName, std::string session
         userQuestion, call.toolName, call.args, toolResult);
     std::cout << "secondPrompt is " << secondPrompt << std::endl;
 
-    messages.push_back({secondPrompt, 0});
+    ScopedMessage phase2Guard(messages, secondPrompt);  // RAII: 异常安全
 
     json secondReq = strategy->buildRequest(messages);
     json secondResp = executeCurl(secondReq);
     std::string finalAnswer = strategy->parseResponse(secondResp);
-
-    messages.pop_back();  // 清理二次提示词
 
     std::cout << "finalAnswer is " << finalAnswer << std::endl;
 
     addMessage(userId, userName, true, userQuestion, sessionId);
     addMessage(userId, userName, false, finalAnswer, sessionId);
     return finalAnswer;
+}
+
+void AIHelper::chatStream(int userId, std::string userName, std::string sessionId,
+                          std::string userQuestion, std::string modelType,
+                          std::function<void(const std::string& token)> on_token,
+                          std::function<void(const std::string& full_answer)> on_done,
+                          std::function<void(const std::string& error)> on_error) {
+    try {
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        setStrategy(StrategyFactory::instance().create(modelType));
+
+        // === 路径 1: 本地 Gemma 推理 ===
+        if (strategy->isLocal()) {
+            if (!GemmaInferencePool::instance().isLoaded()) {
+                on_error("Gemma model not loaded");
+                return;
+            }
+            addMessage(userId, userName, true, userQuestion, sessionId);
+
+            std::string full_text;
+            GemmaInferencePool::instance().generate(
+                sessionId, userQuestion,
+                [&full_text, &on_token](const std::string& token) {
+                    full_text += token;
+                    if (on_token) on_token(token);
+                });
+
+            addMessage(userId, userName, false, full_text, sessionId);
+            if (on_done) on_done(full_text);
+            return;
+        }
+
+        // === 路径 2: 云端 API 非 MCP 流式 ===
+        if (!strategy->isMCPModel) {
+            addMessage(userId, userName, true, userQuestion, sessionId);
+            json payload = strategy->buildStreamRequest(this->messages);
+
+            std::string full_text;
+            executeCurlStream(payload,
+                // on_chunk
+                [&full_text, &on_token](const std::string& delta) {
+                    full_text += delta;
+                    if (on_token) on_token(delta);
+                },
+                // on_done (stream ended)
+                nullptr,
+                // on_error
+                [&on_error](const std::string& err) {
+                    if (on_error) on_error(err);
+                });
+
+            addMessage(userId, userName, false, full_text, sessionId);
+            if (on_done) on_done(full_text);
+            return;
+        }
+
+        // === 路径 3: MCP 两阶段推理（暂保持非流式） ===
+        AIConfig config;
+        config.loadFromFile("../AIApps/ChatServer/resource/config.json");
+        std::string tempUserQuestion = config.buildPrompt(userQuestion);
+
+        ScopedMessage streamPhase1Guard(messages, tempUserQuestion);
+        json firstReq = strategy->buildRequest(this->messages);
+        json firstResp = executeCurl(firstReq);
+        std::string aiResult = strategy->parseResponse(firstResp);
+
+        AIToolCall call = config.parseAIResponse(aiResult);
+
+        if (!call.isToolCall) {
+            addMessage(userId, userName, true, userQuestion, sessionId);
+            addMessage(userId, userName, false, aiResult, sessionId);
+            if (on_done) on_done(aiResult);
+            return;
+        }
+
+        json toolResult;
+        AIToolRegistry registry;
+        try {
+            toolResult = registry.invoke(call.toolName, call.args);
+        } catch (const std::exception& e) {
+            std::string err = "[Tool call failed] " + std::string(e.what());
+            addMessage(userId, userName, true, userQuestion, sessionId);
+            addMessage(userId, userName, false, err, sessionId);
+            if (on_done) on_done(err);
+            return;
+        }
+
+        std::string secondPrompt = config.buildToolResultPrompt(
+            userQuestion, call.toolName, call.args, toolResult);
+        ScopedMessage streamPhase2Guard(messages, secondPrompt);
+        json secondReq = strategy->buildRequest(messages);
+        json secondResp = executeCurl(secondReq);
+        std::string finalAnswer = strategy->parseResponse(secondResp);
+
+        addMessage(userId, userName, true, userQuestion, sessionId);
+        addMessage(userId, userName, false, finalAnswer, sessionId);
+        if (on_done) on_done(finalAnswer);
+
+    } catch (const std::exception& e) {
+        if (on_error) on_error(e.what());
+    }
 }
 
 json AIHelper::request(const json& payload) {
@@ -147,6 +259,84 @@ json AIHelper::executeCurl(const json& payload) {
     }
 }
 
+// SSE 流式 curl — 在 curl 写回调中实时解析 SSE，立刻回调 on_chunk
+void AIHelper::executeCurlStream(
+    const json& payload,
+    std::function<void(const std::string& delta)> on_chunk,
+    std::function<void()> on_done,
+    std::function<void(const std::string&)> on_error) {
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        if (on_error) on_error("Failed to initialize curl");
+        return;
+    }
+
+    struct curl_slist* headers = nullptr;
+    std::string authHeader = "Authorization: Bearer " + strategy->getApiKey();
+    headers = curl_slist_append(headers, authHeader.c_str());
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    std::string payloadStr = payload.dump();
+
+    curl_easy_setopt(curl, CURLOPT_URL, strategy->getApiUrl().c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payloadStr.c_str());
+
+    // 流式解析状态：跨多次写回调增量解析 SSE
+    struct StreamParseState {
+        std::string buffer;      // 未完成的行数据
+        std::shared_ptr<AIStrategy> strat;
+        std::function<void(const std::string&)> on_chunk;
+        std::function<void()> on_done;
+    };
+    StreamParseState state;
+    state.strat = strategy;
+    state.on_chunk = on_chunk;
+    state.on_done = on_done;
+
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+        +[](void* contents, size_t size, size_t nmemb, void* userp) -> size_t {
+            size_t total = size * nmemb;
+            auto* st = static_cast<StreamParseState*>(userp);
+            st->buffer.append(static_cast<char*>(contents), total);
+
+            // 按行增量解析 SSE（每行以 \n 结尾）
+            size_t pos;
+            while ((pos = st->buffer.find('\n')) != std::string::npos) {
+                std::string line = st->buffer.substr(0, pos);
+                st->buffer.erase(0, pos + 1);
+
+                // 去掉行尾 \r
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+
+                const std::string prefix = "data: ";
+                if (line.compare(0, prefix.size(), prefix) != 0) continue;
+
+                std::string data = line.substr(prefix.size());
+                if (data == "[DONE]") {
+                    if (st->on_done) st->on_done();
+                    continue;
+                }
+                std::string token_text;
+                if (st->strat->parseStreamChunk(data, token_text)) {
+                    if (st->on_chunk) st->on_chunk(token_text);
+                }
+            }
+            return total;
+        });
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        if (on_error) on_error(std::string("curl error: ") + curl_easy_strerror(res));
+        return;
+    }
+}
+
 size_t AIHelper::WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
     size_t totalSize = size * nmemb;
     std::string* buffer = static_cast<std::string*>(userp);
@@ -185,5 +375,11 @@ void AIHelper::pushMessageToMysql(int userId, const std::string& userName, bool 
         + std::to_string(ms) + ")";
 
     // 异步投递到 RabbitMQ，消费者线程执行 SQL
-    MQManager::instance().publish("sql_queue", sql);
+    // try-catch 保护：MQ 不可用时不影响对话主流程，消息已写入内存 messages 列表
+    try {
+        MQManager::instance().publish("sql_queue", sql);
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Failed to publish message to MQ (chat continues in memory): " << e.what()
+                  << " | sql=" << sql.substr(0, 200);
+    }
 }
