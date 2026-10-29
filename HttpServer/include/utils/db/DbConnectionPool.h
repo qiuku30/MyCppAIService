@@ -3,59 +3,34 @@
 #include <mutex>
 #include <condition_variable>
 #include <memory>
-#include <thread>
 #include "DbConnection.h"
-
-namespace http 
-{
-namespace db 
-{
-
-class DbConnectionPool 
-{
+namespace http { namespace db {
+// Connections are health-checked only after exclusive removal from the idle queue.
+class DbConnectionPool {
 public:
-    // 单例模式
-    static DbConnectionPool& getInstance() 
-    {
+    static DbConnectionPool& getInstance() {
         static DbConnectionPool instance;
         return instance;
     }
-
-    // 初始化连接池
-    void init(const std::string& host,
-             const std::string& user,
-             const std::string& password,
-             const std::string& database,
-             size_t poolSize = 10);
-
-    // 获取连接
+    void init(const std::string& host, const std::string& user,
+              const std::string& password, const std::string& database, size_t poolSize = 10);
     std::shared_ptr<DbConnection> getConnection();
-
 private:
-    // 构造函数
+    struct State {
+        std::string host, user, password, database;
+        std::queue<std::shared_ptr<DbConnection>> idle;
+        std::mutex mutex;
+        std::condition_variable cv;
+        size_t target = 0;
+        size_t allocated = 0; // idle + checked out + creation reservations
+        bool initialized = false;
+        bool stopping = false;
+    };
     DbConnectionPool();
-    // 析构函数
     ~DbConnectionPool();
-
-    // 禁止拷贝
     DbConnectionPool(const DbConnectionPool&) = delete;
     DbConnectionPool& operator=(const DbConnectionPool&) = delete;
-
-    std::shared_ptr<DbConnection> createConnection();
-
-    void checkConnections(); // 添加连接检查方法
-
-private:
-    std::string                               host_;
-    std::string                               user_;
-    std::string                               password_;
-    std::string                               database_;
-    std::queue<std::shared_ptr<DbConnection>> connections_;
-    std::mutex                                mutex_;
-    std::condition_variable                   cv_;
-    bool                                      initialized_ = false;
-    std::thread                               checkThread_; // 添加检查线程
+    static std::shared_ptr<DbConnection> createConnection(const std::shared_ptr<State>& state);
+    std::shared_ptr<State> state_;
 };
-
-} // namespace db
-} // namespace http
+}} // namespace http::db

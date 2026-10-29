@@ -46,53 +46,37 @@ bool HttpContext::parseRequest(Buffer *buf, Timestamp receiveTime)
                 const char *colon = std::find(buf->peek(), crlf, ':');
                 if (colon < crlf)
                 {
-                    request_.addHeader(buf->peek(), colon, crlf);
+                    if (!request_.addHeader(buf->peek(), colon, crlf)) return false;
                 }
                 else if (buf->peek() == crlf)
-                { 
-                    // 空行，结束Header
-                    // 根据请求方法和Content-Length判断是否需要继续读取body
-                    if (request_.method() == HttpRequest::kPost || 
-                        request_.method() == HttpRequest::kPut)
+                {
+                    // Transfer codings are not decoded by this server. Reject them rather
+                    // than leave their bytes to be parsed as a subsequent request.
+                    if (request_.headers().count("transfer-encoding")) return false;
+
+                    auto contentLength = request_.headers().find("content-length");
+                    if (contentLength != request_.headers().end())
                     {
-                        //拿到请求头里的 Content-Length
-                        std::string contentLength = request_.getHeader("Content-Length");
-                        if (!contentLength.empty())
+                        if (contentLength->second.empty()) return false;
+                        constexpr uint64_t maxBodyLength = 10 * 1024 * 1024;
+                        uint64_t length = 0;
+                        for (unsigned char ch : contentLength->second)
                         {
-                            // 安全转换：捕获 stoi 异常（非数字/溢出）
-                            uint64_t len = 0;
-                            try {
-                                len = std::stoull(contentLength);
-                            } catch (const std::exception&) {
-                                ok = false; hasMore = false; break;
-                            }
-                            // Body 大小上限 10MB，防止内存耗尽
-                            if (len > 10 * 1024 * 1024) {
-                                ok = false; hasMore = false; break;
-                            }
-                            request_.setContentLength(len);
-                            //如果长度 > 0 → 准备读请求体
-                            if (request_.contentLength() > 0)
-                            {
-                                state_ = kExpectBody;
-                            }
-                            else
-                            {
-                                state_ = kGotAll;
-                                hasMore = false;
-                            }
+                            if (ch < '0' || ch > '9') return false;
+                            const unsigned digit = ch - '0';
+                            if (length > (maxBodyLength - digit) / 10) return false;
+                            length = length * 10 + digit;
                         }
-                        else
-                        {
-                            // POST/PUT 请求没有 Content-Length，是HTTP语法错误
-                            ok = false;
-                            hasMore = false;
-                        }
+                        request_.setContentLength(length);
+                        state_ = length > 0 ? kExpectBody : kGotAll;
+                        hasMore = length > 0;
                     }
                     else
                     {
-                        // GET/HEAD/DELETE 等方法直接完成（没有请求体）
-                        state_ = kGotAll; 
+                        // Preserve the application's requirement for explicit POST/PUT length.
+                        if (request_.method() == HttpRequest::kPost ||
+                            request_.method() == HttpRequest::kPut) return false;
+                        state_ = kGotAll;
                         hasMore = false;
                     }
                 }

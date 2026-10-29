@@ -1,0 +1,16 @@
+# Opt in only when using image recognition. Paths match the existing recognizer.
+services:
+  ai-service:
+    volumes:
+      - type: bind
+        source: ${IMAGE_MODEL_HOST_FILE:?Set IMAGE_MODEL_HOST_FILE to the ONNX model file}
+        target: /root/models/mobilenetv2/mobilenetv2-7.onnx
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${IMAGE_LABELS_HOST_FILE:?Set IMAGE_LABELS_HOST_FILE to the ImageNet labels file}
+        target: /root/imagenet_classes.txt
+        read_only: true
+        bind:
+          create_host_path: false

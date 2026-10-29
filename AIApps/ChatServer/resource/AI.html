@@ -279,6 +279,7 @@
             let msgDiv = null;
             let fullContent = '';
             let newSessionId = null;
+            let completed = false;
 
             // 先创建一个空的 AI 消息气泡，后续逐 token 填充
             function ensureMsgDiv() {
@@ -306,32 +307,27 @@
                         if (!line.startsWith('data: ')) continue;
                         const data = line.substring(6);
 
-                        // 检查 sessionId 事件（新会话）
-                        try {
-                            const j = JSON.parse(data);
-                            if (j.sessionId) {
-                                newSessionId = j.sessionId;
-                                continue;
-                            }
-                        } catch (_) {}
-
-                        if (data === '[DONE]') continue;
-
-                        // 解析 token delta
-                        try {
-                            const j = JSON.parse(data);
-                            const token = j.choices?.[0]?.delta?.content || '';
-                            if (token) {
-                                fullContent += token;
-                                const span = ensureMsgDiv();
-                                const safeHtml = DOMPurify.sanitize(marked.parse(fullContent));
-                                span.innerHTML = safeHtml;
-                                chatContainer.scrollTop = chatContainer.scrollHeight;
-                            }
-                        } catch (_) {}
+                        if (data === '[DONE]') { completed = true; continue; }
+                        let j;
+                        try { j = JSON.parse(data); }
+                        catch (_) { throw new Error('Invalid stream response'); }
+                        if (j.error) {
+                            throw new Error(typeof j.error === 'string' ? j.error :
+                                (j.error.message || 'Model request failed'));
+                        }
+                        if (j.sessionId) { newSessionId = j.sessionId; continue; }
+                        const token = j.choices?.[0]?.delta?.content || '';
+                        if (token) {
+                            fullContent += token;
+                            const span = ensureMsgDiv();
+                            span.innerHTML = DOMPurify.sanitize(marked.parse(fullContent));
+                            chatContainer.scrollTop = chatContainer.scrollHeight;
+                        }
                     }
                 }
             }
+            if (!completed) throw new Error('Stream incomplete: connection closed before completion');
+            if (!fullContent) throw new Error('Empty model response');
             return { fullContent, newSessionId, msgDiv };
         }
 

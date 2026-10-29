@@ -1,0 +1,4 @@
+{
+    global: cpuinfo_probe_initialize;
+    local: *;
+};

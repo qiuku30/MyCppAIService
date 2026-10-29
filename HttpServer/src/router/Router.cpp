@@ -26,6 +26,7 @@ bool Router::route(const HttpRequest &req, HttpResponse *resp)
     auto handlerIt = handlers_.find(key);
     if (handlerIt != handlers_.end())
     {
+        resp->setLogRoute(handlerIt->first.path);
         handlerIt->second->handle(req, resp);
         return true;
     }
@@ -34,13 +35,15 @@ bool Router::route(const HttpRequest &req, HttpResponse *resp)
     auto callbackIt = callbacks_.find(key);
     if (callbackIt != callbacks_.end())
     {
+        resp->setLogRoute(callbackIt->first.path);
         callbackIt->second(req, resp);
         return true;
     }
 
     // 查找动态路由处理器
-    for (const auto &[method, pathRegex, handler] : regexHandlers_)
+    for (size_t index = 0; index < regexHandlers_.size(); ++index)
     {
+        const auto &[method, pathRegex, handler] = regexHandlers_[index];
         std::smatch match;
         std::string pathStr(req.path());
         // 如果方法匹配并且动态路由匹配，则执行处理器
@@ -50,14 +53,16 @@ bool Router::route(const HttpRequest &req, HttpResponse *resp)
             HttpRequest newReq(req); // 因为这里需要用这一次所以是可以改的
             extractPathParameters(match, newReq);
             
+            resp->setLogRoute(regexHandlerLabels_[index]);
             handler->handle(newReq, resp);
             return true;
         }
     }
 
     // 查找动态路由回调函数
-    for (const auto &[method, pathRegex, callback] : regexCallbacks_)
+    for (size_t index = 0; index < regexCallbacks_.size(); ++index)
     {
+        const auto &[method, pathRegex, callback] = regexCallbacks_[index];
         std::smatch match;
         std::string pathStr(req.path());
         // 如果方法匹配并且动态路由匹配，则执行回调函数
@@ -67,6 +72,7 @@ bool Router::route(const HttpRequest &req, HttpResponse *resp)
             HttpRequest newReq(req); // 因为这里需要用这一次所以是可以改的
             extractPathParameters(match, newReq);
 
+            resp->setLogRoute(regexCallbackLabels_[index]);
             callback(newReq, resp);  // 修复：传注入了路径参数的 newReq
             return true;
         }

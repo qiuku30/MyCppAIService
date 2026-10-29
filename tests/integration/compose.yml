@@ -1,0 +1,92 @@
+name: mycpp-it
+
+x-labels: &integration-labels
+  io.mycpp.integration: "true"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mycpp-it-mysql
+    labels: *integration-labels
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Provide dedicated integration password}
+      MYSQL_DATABASE: mycpp_it
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ../../deploy/init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: mycpp-it-rabbitmq
+    hostname: mycpp-it-rabbitmq
+    labels: *integration-labels
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-mycpp_it}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:?Provide dedicated integration password}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  control:
+    image: ${IT_APP_IMAGE:-mycppaiservice-build:integration}
+    container_name: mycpp-it-control
+    labels: *integration-labels
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: ${RABBITMQ_USER:-mycpp_it}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:?Provide dedicated integration password}
+    entrypoint: ["sleep", "infinity"]
+    command: []
+
+  app:
+    image: ${IT_APP_IMAGE:-mycppaiservice-build:integration}
+    container_name: mycpp-it-app
+    labels: *integration-labels
+    init: true
+    working_dir: /workspace/build
+    volumes:
+      - ../..:/workspace:ro
+      - app_build:/workspace/build
+      - ${GEMMA_SOURCE_HOST_DIR:?Provide real Gemma source directory}:/opt/gemma-src:ro
+      - ${GEMMA_BUILD_HOST_DIR:?Provide real Linux Gemma build directory}:/opt/gemma:ro
+      - ${GEMMA_MODELS_HOST_DIR:?Provide model directory; may be empty}:/opt/gemma-models:ro
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Provide dedicated integration password}
+      DB_NAME: mycpp_it
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-mycpp_it}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:?Provide dedicated integration password}
+      GEMMA_SOURCE_DIR: /opt/gemma-src
+      GEMMA_BUILD_DIR: /opt/gemma
+      GEMMA_MODEL_PATH: /opt/gemma-models/${GEMMA_MODEL_FILE:-2.0-2b-it-sfp.sbs}
+      GEMMA_TOKENIZER_PATH: /opt/gemma-models/${GEMMA_TOKENIZER_FILE:-tokenizer.spm}
+      BUILD_JOBS: ${BUILD_JOBS:-1}
+    ports:
+      - "127.0.0.1:${IT_HTTP_PORT:-18117}:8117"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: ["sh", "/workspace/deploy/build-and-run.sh", "-p", "8117"]
+
+volumes:
+  mysql_data:
+    labels: *integration-labels
+  rabbitmq_data:
+    labels: *integration-labels
+  app_build:
+    labels: *integration-labels

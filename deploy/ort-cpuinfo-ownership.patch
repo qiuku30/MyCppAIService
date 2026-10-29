@@ -1,0 +1,26 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -244,6 +244,22 @@ ELSE()
+   MESSAGE(FATAL_ERROR "Unsupported library type ${CPUINFO_LIBRARY_TYPE}")
+ ENDIF()
+ ADD_LIBRARY(cpuinfo_internals STATIC ${CPUINFO_SRCS})
++# Private ARM64 shared-library consumers can lose unused cache ownership
++# globals under IPO while the initialization calloc calls remain observable.
++# Keep cpuinfo's process-lifetime tables owned; preserve CPU detection and -O3.
++IF(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
++   CPUINFO_TARGET_PROCESSOR MATCHES "^(aarch64|arm64)$" AND
++   CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang)$")
++  FOREACH(cpuinfo_target cpuinfo cpuinfo_internals)
++    SET_TARGET_PROPERTIES(${cpuinfo_target} PROPERTIES
++      INTERPROCEDURAL_OPTIMIZATION FALSE
++      INTERPROCEDURAL_OPTIMIZATION_DEBUG FALSE
++      INTERPROCEDURAL_OPTIMIZATION_RELEASE FALSE
++      INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO FALSE
++      INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL FALSE)
++    TARGET_COMPILE_OPTIONS(${cpuinfo_target} PRIVATE -fno-lto)
++  ENDFOREACH()
++ENDIF()
+ CPUINFO_TARGET_ENABLE_C99(cpuinfo)
+ CPUINFO_TARGET_ENABLE_C99(cpuinfo_internals)
+ CPUINFO_TARGET_RUNTIME_LIBRARY(cpuinfo)

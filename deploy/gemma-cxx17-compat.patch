@@ -1,0 +1,12 @@
+diff --git a/gemma/flash_attention.cc b/gemma/flash_attention.cc
+--- a/gemma/flash_attention.cc
++++ b/gemma/flash_attention.cc
+@@ -1559,7 +1559,7 @@
+           x_1_p_1, x_2_p_0, x_2_p_1, x_3_p_0, x_3_p_1, x_4_p_0, x_4_p_1,
+           x_5_p_0, x_5_p_1, x_6_p_0, x_6_p_1, x_7_p_0, x_7_p_1);
+     } else {
+-      static_assert(false,
++      static_assert(IsF32<Q_T>() || IsBF16<Q_T>() || IsInt16<Q_T>(),
+                     "Query type not supported, only float, BF16, and "
+                     "Int16 are supported");
+     }

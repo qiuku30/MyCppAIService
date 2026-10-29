@@ -115,31 +115,54 @@ void HttpRequest::setQueryParameters(const char *start, const char *end)
 }
 
 //用于解析一个 HTTP 头部行，并将键值对存入 headers_ 映射中
-void HttpRequest::addHeader(const char *start, const char *colon, const char *end)
+bool HttpRequest::addHeader(const char *start, const char *colon, const char *end)
 {
     std::string key(start, colon);
+    if (key.empty()) return false;
+    for (char& ch : key)
+    {
+        const bool token = (ch >= '0' && ch <= '9') ||
+                           (ch >= 'A' && ch <= 'Z') ||
+                           (ch >= 'a' && ch <= 'z') ||
+                           std::string("!#$%&'*+-.^_`|~").find(ch) != std::string::npos;
+        if (!token) return false;
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+    }
+
     ++colon;
-    while (colon < end && isspace(*colon))
-    {
-        ++colon;
-    }
+    while (colon < end && (*colon == ' ' || *colon == '\t')) ++colon;
+    while (end > colon && (end[-1] == ' ' || end[-1] == '\t')) --end;
     std::string value(colon, end);
-    while (!value.empty() && isspace(value[value.size() - 1])) // 消除尾部空格
+    for (unsigned char ch : value)
     {
-        value.resize(value.size() - 1);
+        if ((ch < 0x20 && ch != '\t') || ch == 0x7f) return false;
     }
-    headers_[key] = value;
+
+    auto previous = headers_.find(key);
+    if (key == "content-length" && previous != headers_.end() && previous->second != value)
+    {
+        return false;
+    }
+    if (key == "connection" && previous != headers_.end())
+    {
+        previous->second += "," + value;
+    }
+    else
+    {
+        headers_[key] = value;
+    }
+    return true;
 }
 
 std::string HttpRequest::getHeader(const std::string &field) const
 {
-    std::string result;
-    auto it = headers_.find(field);
-    if (it != headers_.end())
+    std::string key = field;
+    for (char& ch : key)
     {
-        result = it->second;
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
     }
-    return result;
+    auto it = headers_.find(key);
+    return it == headers_.end() ? std::string() : it->second;
 }
 
 void HttpRequest::swap(HttpRequest &that)
@@ -151,6 +174,9 @@ void HttpRequest::swap(HttpRequest &that)
     std::swap(version_, that.version_);
     std::swap(headers_, that.headers_);
     std::swap(receiveTime_, that.receiveTime_);
+    std::swap(content_, that.content_);
+    std::swap(contentLength_, that.contentLength_);
+    std::swap(connection_, that.connection_);
 }
 
 } // namespace http

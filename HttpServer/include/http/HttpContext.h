@@ -35,6 +35,10 @@ public:
         request_.swap(dummyData);
     }
 
+    // This state belongs to the connection and survives per-request reset().
+    void stopProcessing() { processingStopped_ = true; }
+    bool processingStopped() const { return processingStopped_; }
+
     const HttpRequest& request() const
     { return request_;}
 
@@ -46,6 +50,7 @@ private:
 private:
     HttpRequestParseState state_;// 解析状态：当前解析到哪一步
     HttpRequest           request_;// 存储解析结果：最终生成的请求对象
+    bool                  processingStopped_ = false; // closing or handed to a streaming handler
 };
 
 } // namespace http

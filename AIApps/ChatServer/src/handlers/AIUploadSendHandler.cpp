@@ -23,19 +23,6 @@ void AIUploadSendHandler::handle(const http::HttpRequest& req, http::HttpRespons
         }
 
         int userId = std::stoi(session->getValue("userId"));
-        std::shared_ptr<ImageRecognizer> ImageRecognizerPtr;
-        {
-            std::lock_guard<std::mutex> lock(server_->mutexForImageRecognizerMap);
-            if (server_->ImageRecognizerMap.find(userId) == server_->ImageRecognizerMap.end()) {
-
-                server_->ImageRecognizerMap.emplace(
-                    userId,
-                    std::make_shared<ImageRecognizer>("/root/models/mobilenetv2/mobilenetv2-7.onnx")  //todo:Remove hard coding
-                );
-            }
-            ImageRecognizerPtr = server_->ImageRecognizerMap[userId];
-        }
-
         auto body = req.getBody();
         std::string filename;
         std::string imageBase64;
@@ -49,18 +36,32 @@ void AIUploadSendHandler::handle(const http::HttpRequest& req, http::HttpRespons
             throw std::runtime_error("No image data provided");
         }
 
+        const size_t maxEncoded = image_resource::GetPolicy().encoded;
+        if (imageBase64.size() > ((maxEncoded + 2) / 3) * 4)
+            throw image_resource::Error(413, "Encoded image exceeds resource budget");
         std::string decodedData = base64_decode(imageBase64);
         std::vector<uchar> imgData(decodedData.begin(), decodedData.end());
 
-        std::string className = ImageRecognizerPtr->PredictFromBuffer(imgData);
+        // Header preflight is cheap and precedes per-user model construction.
+        image_resource::Preflight(imgData);
+        std::shared_ptr<ImageRecognizer> ImageRecognizerPtr;
+        {
+            std::lock_guard<std::mutex> lock(server_->mutexForImageRecognizerMap);
+            if (server_->ImageRecognizerMap.find(userId) == server_->ImageRecognizerMap.end()) {
+                server_->ImageRecognizerMap.emplace(userId,
+                    std::make_shared<ImageRecognizer>("/root/models/mobilenetv2/mobilenetv2-7.onnx"));
+            }
+            ImageRecognizerPtr = server_->ImageRecognizerMap[userId];
+        }
+        const auto prediction = ImageRecognizerPtr->PredictFromBufferWithConfidence(imgData);
 
 
         json successResp;
         successResp["success"] = "ok";
         successResp["filename"] = filename;
-        successResp["class_name"] = className;
+        successResp["class_name"] = prediction.label;
 
-        successResp["confidence"] = 0.95; // todo:Calculating true confidence
+        successResp["confidence"] = prediction.confidence;
 
 
         std::string successBody = successResp.dump(4);
@@ -80,7 +81,12 @@ void AIUploadSendHandler::handle(const http::HttpRequest& req, http::HttpRespons
         failureResp["status"] = "error";
         failureResp["message"] = e.what();
         std::string failureBody = failureResp.dump(4);
-        resp->setStatusLine(req.getVersion(), http::HttpResponse::k400BadRequest, "Bad Request");
+        const auto* resourceError = dynamic_cast<const image_resource::Error*>(&e);
+        const int status = resourceError ? resourceError->status : 400;
+        const auto code = status == 413 ? http::HttpResponse::k413PayloadTooLarge :
+            status == 503 ? http::HttpResponse::k503ServiceUnavailable : http::HttpResponse::k400BadRequest;
+        resp->setVersion(req.getVersion());
+        resp->setStatusCode(code);
         resp->setCloseConnection(true);
         resp->setContentType("application/json");
         resp->setContentLength(failureBody.size());

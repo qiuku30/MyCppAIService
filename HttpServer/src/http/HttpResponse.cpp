@@ -3,40 +3,56 @@
 namespace http
 {
 
+void HttpResponse::setStatusCode(HttpStatusCode code)
+{
+    statusCode_ = code;
+    switch (code)
+    {
+    case k200Ok: statusMessage_ = "OK"; break;
+    case k204NoContent: statusMessage_ = "No Content"; break;
+    case k301MovedPermanently: statusMessage_ = "Moved Permanently"; break;
+    case k400BadRequest: statusMessage_ = "Bad Request"; break;
+    case k401Unauthorized: statusMessage_ = "Unauthorized"; break;
+    case k403Forbidden: statusMessage_ = "Forbidden"; break;
+    case k404NotFound: statusMessage_ = "Not Found"; break;
+    case k409Conflict: statusMessage_ = "Conflict"; break;
+    case k413PayloadTooLarge: statusMessage_ = "Payload Too Large"; break;
+    case k500InternalServerError: statusMessage_ = "Internal Server Error"; break;
+    case k503ServiceUnavailable: statusMessage_ = "Service Unavailable"; break;
+    default:
+        statusCode_ = k500InternalServerError;
+        statusMessage_ = "Internal Server Error";
+        break;
+    }
+}
+
 void HttpResponse::appendToBuffer(muduo::net::Buffer* outputBuf) const
 {
-    // HttpResponse封装的信息格式化输出
-    char buf[32]; 
-    // 为什么不把状态信息放入格式化字符串中，因为状态信息有长有短，不方便定义一个固定大小的内存存储
-    snprintf(buf, sizeof buf, "%s %d ", httpVersion_.c_str(), statusCode_);
-    
-    outputBuf->append(buf);
-    outputBuf->append(statusMessage_);
-    outputBuf->append("\r\n");
+    outputBuf->append(httpVersion_ + " " + std::to_string(statusCode_) + " " + statusMessage_ + "\r\n");
+    outputBuf->append(closeConnection_ ? "Connection: close\r\n" : "Connection: Keep-Alive\r\n");
 
-    if (closeConnection_) // 思考一下这些地方是不是可以直接移入近headers_中
+    const bool noBody = (statusCode_ >= 100 && statusCode_ < 200) ||
+                        statusCode_ == k204NoContent || statusCode_ == 304;
+    if (!streaming_ && !noBody)
     {
-        outputBuf->append("Connection: close\r\n");
+        outputBuf->append("Content-Length: " + std::to_string(body_.size()) + "\r\n");
     }
-    else
-    {
-        //snprintf(buf, sizeof buf, "Content-Length: %zd\r\n", body_.size());
-        //outputBuf->append(buf);
-        outputBuf->append("Connection: Keep-Alive\r\n");
-    }
-
     for (const auto& header : headers_)
-    { // 为什么这里不用格式化字符串？因为key和value的长度不定
+    {
+        std::string key = header.first;
+        for (char& ch : key)
+        {
+            if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+        }
+        if (key == "connection") continue;
+        if ((!streaming_ || noBody) && (key == "content-length" || key == "transfer-encoding")) continue;
         outputBuf->append(header.first);
-        outputBuf->append(": "); 
+        outputBuf->append(": ");
         outputBuf->append(header.second);
         outputBuf->append("\r\n");
     }
     outputBuf->append("\r\n");
-
-    if (!streaming_) {
-        outputBuf->append(body_);
-    }
+    if (!streaming_ && !noBody) outputBuf->append(body_);
 }
 
 void HttpResponse::setStatusLine(const std::string& version,

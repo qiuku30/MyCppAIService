@@ -39,6 +39,10 @@ public:
     // 返回 true 表示成功提取到 token_text
     virtual bool parseStreamChunk(const std::string& sseData, std::string& tokenText) const;
 
+    // Provider-specific HTTP stream negotiation and terminal event detection.
+    virtual std::vector<std::string> streamHeaders() const { return {}; }
+    virtual bool isStreamComplete(const json&) const { return false; }
+
     bool isMCPModel = false;
 
 };
@@ -100,6 +104,10 @@ public:
 
     json buildRequest(const std::vector<std::pair<std::string, long long>>& messages) const override;
     std::string parseResponse(const json& response) const override;
+    json buildStreamRequest(const std::vector<std::pair<std::string, long long>>&) const override;
+    bool parseStreamChunk(const std::string&, std::string&) const override;
+    std::vector<std::string> streamHeaders() const override;
+    bool isStreamComplete(const json&) const override;
 
 private:
     std::string apiKey_;

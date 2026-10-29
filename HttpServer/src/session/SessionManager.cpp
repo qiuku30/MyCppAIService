@@ -1,7 +1,8 @@
 #include"../include/session/SessionManager.h"
 #include <iomanip>
-#include <iostream>
+#include <cstdio>
 #include <sstream>
+#include <stdexcept>
 
 namespace http
 {
@@ -9,45 +10,80 @@ namespace session
 {
 
 // 初始化会话管理器，设置会话存储对象和随机数生成器
-SessionManager::SessionManager(std::unique_ptr<SessionStorage> storage)
-    : storage_(std::move(storage)) 
-    , rng_(std::random_device{}()) // 初始化随机数生成器，用于生成随机的会话ID
-{}
+SessionManager::SessionManager(std::unique_ptr<SessionStorage> storage,
+                               std::chrono::milliseconds cleanupInterval,
+                               int sessionMaxAge)
+    : storage_(std::move(storage))
+    , rng_(std::random_device{}())
+    , cleanupInterval_(cleanupInterval)
+    , sessionMaxAge_(sessionMaxAge)
+{
+    if (!storage_) throw std::invalid_argument("Session storage must not be null");
+    if (cleanupInterval_.count() <= 0) throw std::invalid_argument("Session cleanup interval must be positive");
+    if (sessionMaxAge_ <= 0) throw std::invalid_argument("Session lifetime must be positive");
+    cleanupThread_ = std::thread(&SessionManager::cleanupLoop, this);
+}
+
+SessionManager::~SessionManager()
+{
+    {
+        std::lock_guard<std::mutex> lock(cleanupMutex_);
+        stopping_ = true;
+    }
+    cleanupCv_.notify_all();
+    if (cleanupThread_.joinable()) cleanupThread_.join();
+    lifetime_.reset();
+}
+
+void SessionManager::cleanupLoop()
+{
+    std::unique_lock<std::mutex> lock(cleanupMutex_);
+    while (!cleanupCv_.wait_for(lock, cleanupInterval_, [this] { return stopping_; }))
+    {
+        lock.unlock();
+        try
+        {
+            cleanExpiredSessions();
+        }
+        catch (...)
+        {
+            // Fixed diagnostic only: backend exception payloads may contain secrets.
+            std::fputs("session_cleanup_error category=storage_exception\n", stderr);
+        }
+        lock.lock();
+    }
+}
 
 // 从请求中获取或创建会话，也就是说，如果请求中包含会话ID，则从存储中加载会话，否则创建一个新的会话
 std::shared_ptr<Session> SessionManager::getSession(const HttpRequest& req, HttpResponse* resp)
-{   
-    //从浏览器的 Cookie 里拿 sessionId
-    std::string sessionId = getSessionIdFromCookie(req);
-    
-    std::shared_ptr<Session> session;
-
-    //如果有 sessionId，尝试加载
-    if (!sessionId.empty())
+{
+    const auto sessionId = getSessionIdFromCookie(req);
+    auto session = sessionId.empty() ? nullptr : storage_->loadAndRefresh(sessionId);
+    if (session)
     {
-        session = storage_->load(sessionId);
+        session->setManager(this);
+        return session;
     }
 
-    //如果会话不存在 或 已过期 → 创建新会话
-    if (!session || session->isExpired())
+    session = std::make_shared<Session>(generateSessionId(), this, sessionMaxAge_);
+    if (!storage_->admit(session))
     {
-        sessionId = generateSessionId();
-        session = std::make_shared<Session>(sessionId, this);
-        setSessionCookie(sessionId, resp);
+        // HttpServer already propagates HttpResponse exceptions. In particular,
+        // this bypasses login handlers' std::exception -> HTTP400 catch blocks.
+        HttpResponse unavailable(true);
+        unavailable.setStatusCode(HttpResponse::k503ServiceUnavailable);
+        unavailable.setContentType("text/plain; charset=utf-8");
+        unavailable.setBody("Session capacity unavailable");
+        throw unavailable;
     }
-    else 
-    {
-        session->setManager(this); // 为现有会话设置管理器
-    }
-
-    session->refresh();
-    storage_->save(session);  // 这里可能有问题，需要确保正确保存会话
+    setSessionCookie(session->getId(), resp);
     return session;
 }
 
 // 生成唯一的会话标识符，确保会话的唯一性和安全性
 std::string SessionManager::generateSessionId()
 {
+    std::lock_guard<std::mutex> lock(rngMutex_);
     std::stringstream ss;
     std::uniform_int_distribution<> dist(0, 15);
 
@@ -66,9 +102,7 @@ void SessionManager::destroySession(const std::string& sessionId)
 
 void SessionManager::cleanExpiredSessions()
 {
-    // 注意：这个实现依赖于具体的存储实现
-    // 对于内存存储，可以在加载时检查是否过期
-    // 对于其他存储的实现，可能需要定期清理过期会话
+    storage_->cleanExpired();
 }
 
 std::string SessionManager::getSessionIdFromCookie(const HttpRequest& req)

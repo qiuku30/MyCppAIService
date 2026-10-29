@@ -47,16 +47,13 @@ void ChatSendHandler::handle(const http::HttpRequest& req, http::HttpResponse* r
         {
             std::lock_guard<std::mutex> lock(server_->mutexForChatInformation);
 
-            auto& userSessions = server_->chatInformation[userId];
-
-            if (userSessions.find(sessionId) == userSessions.end()) {
-
-                userSessions.emplace(
-                    sessionId,
-                    std::make_shared<AIHelper>()
-                );
-            }
-            AIHelperPtr= userSessions[sessionId];
+            auto user = server_->chatInformation.find(userId);
+            if (sessionId.empty() || user == server_->chatInformation.end())
+                throw std::invalid_argument("Unknown chat session");
+            auto found = user->second.find(sessionId);
+            if (found == user->second.end())
+                throw std::invalid_argument("Unknown chat session");
+            AIHelperPtr = found->second;
         }
 
         // === SSE 流式路径 ===

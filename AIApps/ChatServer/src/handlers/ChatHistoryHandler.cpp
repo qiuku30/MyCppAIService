@@ -1,4 +1,5 @@
 #include "../include/handlers/ChatHistoryHandler.h"
+#include <stdexcept>
 
 void ChatHistoryHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
 {
@@ -32,25 +33,18 @@ void ChatHistoryHandler::handle(const http::HttpRequest& req, http::HttpResponse
             if (j.contains("sessionId")) sessionId = j["sessionId"];
         }
 
-        std::vector<std::pair<std::string, long long>> messages;
-
+        std::shared_ptr<AIHelper> helper;
         {
-            std::shared_ptr<AIHelper> AIHelperPtr;
             std::lock_guard<std::mutex> lock(server_->mutexForChatInformation);
-
-            auto& userSessions = server_->chatInformation[userId];
-
-            if (userSessions.find(sessionId) == userSessions.end()) {
-
-                userSessions.emplace( 
-                    sessionId,
-                    std::make_shared<AIHelper>()
-                );
-            }
-            AIHelperPtr= userSessions[sessionId];
-            messages= AIHelperPtr->GetMessages();
+            const auto user = server_->chatInformation.find(userId);
+            if (user == server_->chatInformation.end())
+                throw std::invalid_argument("Unknown chat session");
+            const auto found = user->second.find(sessionId);
+            if (found == user->second.end())
+                throw std::invalid_argument("Unknown chat session");
+            helper = found->second;
         }
-
+        const auto messages = helper->GetHistorySnapshot();
 
         json successResp;
         successResp["success"] = true;
@@ -58,8 +52,9 @@ void ChatHistoryHandler::handle(const http::HttpRequest& req, http::HttpResponse
 
         for (size_t i = 0; i < messages.size(); ++i) {
             json msgJson;
-            msgJson["is_user"] = (i % 2 == 0);
-            msgJson["content"] = messages[i].first;
+            msgJson["is_user"] = messages[i].isUser;
+            msgJson["content"] = messages[i].content;
+            msgJson["ts"] = messages[i].timestamp;
             successResp["history"].push_back(msgJson);
         }
 

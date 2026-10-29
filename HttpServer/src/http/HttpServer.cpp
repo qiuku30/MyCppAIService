@@ -1,4 +1,5 @@
 #include "../../include/http/HttpServer.h"
+#include "../../include/http/HttpRequestLog.h"
 
 #include <any>
 #include <functional>
@@ -8,10 +9,9 @@ namespace http
 {
 
 // 默认http回应函数
-void defaultHttpCallback(const HttpRequest &, HttpResponse *resp)
+void defaultHttpCallback(const HttpRequest &req, HttpResponse *resp)
 {
-    resp->setStatusCode(HttpResponse::k404NotFound);
-    resp->setStatusMessage("Not Found");
+    resp->setStatusLine(req.getVersion(), HttpResponse::k404NotFound, "Not Found");
     resp->setCloseConnection(true);
 }
 
@@ -20,9 +20,10 @@ HttpServer::HttpServer(int port,
                        bool useSSL,
                        muduo::net::TcpServer::Option option)
     : listenAddr_(port)
+    , mainLoop_()
     , server_(&mainLoop_, listenAddr_, name, option)
-    , useSSL_(useSSL)
     , httpCallback_(std::bind(&HttpServer::handleRequest, this, std::placeholders::_1, std::placeholders::_2))
+    , useSSL_(useSSL)
 {
     initialize();
 }
@@ -100,6 +101,7 @@ void HttpServer::onMessage(const muduo::net::TcpConnectionPtr &conn,
                            muduo::net::Buffer *buf,
                            muduo::Timestamp receiveTime)
 {
+    HttpContext* context = nullptr;
     try
     {
         // 这层判断只是代表是否支持ssl
@@ -132,63 +134,119 @@ void HttpServer::onMessage(const muduo::net::TcpConnectionPtr &conn,
             }
         }
         // HttpContext对象用于解析出buf中的请求报文，并把报文的关键信息封装到HttpRequest对象中
-        HttpContext *context = boost::any_cast<HttpContext>(conn->getMutableContext());
-        if (!context->parseRequest(buf, receiveTime)) // 解析一个http请求
+        context = boost::any_cast<HttpContext>(conn->getMutableContext());
+        if (context->processingStopped())
         {
-            // 如果解析http报文过程中出错
-            conn->send("HTTP/1.1 400 Bad Request\r\n\r\n");
-            conn->shutdown();
+            buf->retrieve(buf->readableBytes());
+            return;
         }
-        // 如果buf缓冲区中解析出一个完整的数据包才封装响应报文
-        if (context->gotAll())
+        while (conn->connected() && buf->readableBytes() > 0)
         {
-            onRequest(conn, context->request());
+            if (!context->parseRequest(buf, receiveTime))
+            {
+                context->stopProcessing();
+                buf->retrieve(buf->readableBytes());
+                conn->send("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                conn->shutdown();
+                return;
+            }
+            // A partial request must wait for the next message callback.
+            if (!context->gotAll()) return;
+
+            const bool canContinue = onRequest(conn, context->request());
             context->reset();
+            if (!canContinue)
+            {
+                context->stopProcessing();
+                buf->retrieve(buf->readableBytes());
+                return;
+            }
+        }
+        if (!conn->connected())
+        {
+            context->stopProcessing();
+            buf->retrieve(buf->readableBytes());
         }
     }
-    catch (const std::exception &e)
+    catch (const std::exception &)
     {
         // 捕获异常，返回错误信息
-        LOG_ERROR << "Exception in onMessage: " << e.what();
-        conn->send("HTTP/1.1 400 Bad Request\r\n\r\n");
+        if (context) context->stopProcessing();
+        buf->retrieve(buf->readableBytes());
+        LOG_ERROR << "http_error category=message_exception";
+        conn->send("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
         conn->shutdown();
     }
 }
 
 //将一个完整的 HTTP 请求交由业务逻辑处理，生成响应，发送给客户端，并决定是否关闭连接
-void HttpServer::onRequest(const muduo::net::TcpConnectionPtr &conn, const HttpRequest &req)
+bool HttpServer::onRequest(const muduo::net::TcpConnectionPtr &conn, const HttpRequest &req)
 {
-    //读取请求头 Connection
-    const std::string &connection = req.getHeader("Connection");
-    //判断是否要关闭连接
-    bool close = ((connection == "close") ||
-                  (req.getVersion() == "HTTP/1.0" && connection != "Keep-Alive"));
+    const auto started = request_log::Clock::now();
+    const auto requestId = request_log::nextId();
+    const std::string connection = req.getHeader("Connection");
+    const auto hasConnectionToken = [&connection](const std::string& expected)
+    {
+        size_t begin = 0;
+        while (begin < connection.size())
+        {
+            const size_t comma = connection.find(',', begin);
+            std::string token = connection.substr(begin, comma == std::string::npos ? comma : comma - begin);
+            const size_t first = token.find_first_not_of(" \t");
+            if (first != std::string::npos)
+            {
+                token = token.substr(first, token.find_last_not_of(" \t") - first + 1);
+                for (char& ch : token)
+                {
+                    if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+                }
+                if (token == expected) return true;
+            }
+            if (comma == std::string::npos) break;
+            begin = comma + 1;
+        }
+        return false;
+    };
+    const bool close = hasConnectionToken("close") ||
+                       (req.getVersion() == "HTTP/1.0" && !hasConnectionToken("keep-alive"));
     HttpResponse response(close);
+    response.setVersion(req.getVersion());
 
     // 注入 TcpConnection 供 Handler 流式发送 SSE 数据
     const_cast<HttpRequest&>(req).setConnection(conn);
 
     // 根据请求报文信息来封装响应报文对象
-    httpCallback_(req, &response); // 执行onHttpCallback函数
+    try {
+        httpCallback_(req, &response);
+    } catch (const std::exception&) {
+        // onMessage retains the existing fixed 400 response for callback exceptions.
+        constexpr size_t errorBytes = sizeof("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n") - 1;
+        request_log::record(requestId, req.method(), "error", 400, started, errorBytes);
+        throw;
+    }
 
     // 流式响应：Handler 已接管连接，跳过序列化和 send
     if (response.isStreaming()) {
-        LOG_INFO << "Streaming response, handler took over connection";
-        return;
+        request_log::record(requestId, req.method(), response.logRoute(), response.getStatusCode(), started, 0, true);
+        return false;
     }
+
+    // A request's close token cannot be overridden by a normal handler.
+    if (close) response.setCloseConnection(true);
 
     // 可以给response设置一个成员，判断是否请求的是文件，如果是文件设置为true，并且存在文件位置在这里send出去。
     muduo::net::Buffer buf;
     response.appendToBuffer(&buf);
-    // 打印完整的响应内容用于调试
-    LOG_INFO << "Sending response:\n" << buf.toStringPiece().as_string();
+    request_log::record(requestId, req.method(), response.logRoute(), response.getStatusCode(), started, buf.readableBytes());
 
     conn->send(&buf);
     // 如果是短连接的话，返回响应报文后就断开连接
     if (response.closeConnection())
     {
         conn->shutdown();
+        return false;
     }
+    return conn->connected();
 }
 
 // 执行请求对应的路由处理函数
@@ -203,10 +261,8 @@ void HttpServer::handleRequest(const HttpRequest &req, HttpResponse *resp)
         // 路由处理
         if (!router_.route(mutableReq, resp))
         {
-            LOG_INFO << "请求的啥，url：" << req.method() << " " << req.path();
-            LOG_INFO << "未找到路由，返回404";
-            resp->setStatusCode(HttpResponse::k404NotFound);
-            resp->setStatusMessage("Not Found");
+            resp->setLogRoute("unmatched");
+            resp->setStatusLine(req.getVersion(), HttpResponse::k404NotFound, "Not Found");
             resp->setCloseConnection(true);
         }
 
@@ -217,11 +273,16 @@ void HttpServer::handleRequest(const HttpRequest &req, HttpResponse *resp)
     {
         // 处理中间件抛出的响应（如CORS预检请求）
         *resp = res;
+        resp->setLogRoute(req.method() == HttpRequest::kOptions ? "preflight" : "callback");
+        resp->setVersion(req.getVersion());
     }
     catch (const std::exception& e) 
     {
         // 错误处理
-        resp->setStatusCode(HttpResponse::k500InternalServerError);
+        *resp = HttpResponse(true);
+        resp->setLogRoute("error");
+        LOG_ERROR << "http_error category=handler_exception";
+        resp->setStatusLine(req.getVersion(), HttpResponse::k500InternalServerError, "Internal Server Error");
         resp->setBody(e.what());
     }
 }

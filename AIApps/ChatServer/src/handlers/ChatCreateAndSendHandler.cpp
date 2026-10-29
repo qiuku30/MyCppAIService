@@ -1,6 +1,7 @@
 #include "../include/handlers/ChatCreateAndSendHandler.h"
 #include <muduo/net/Buffer.h>
 #include <thread>
+#include "../include/AIUtil/SecureId.h"
 
 
 void ChatCreateAndSendHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
@@ -40,14 +41,12 @@ void ChatCreateAndSendHandler::handle(const http::HttpRequest& req, http::HttpRe
             stream = j.value("stream", false);
         }
 
-        AISessionIdGenerator generator;
-        std::string sessionId = generator.generate();
-        std::cout<<"ɵsessionIdΪ "<<sessionId<<std::endl;
+        std::string sessionId = secureId();
 
 
         std::shared_ptr<AIHelper> AIHelperPtr;
         {
-            std::lock_guard<std::mutex> lock(server_->mutexForChatInformation);
+            std::scoped_lock lock(server_->mutexForChatInformation, server_->mutexForSessionsId);
 
             auto& userSessions = server_->chatInformation[userId];
 

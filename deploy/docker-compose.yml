@@ -4,12 +4,13 @@ services:
     container_name: ai-mysql
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-aiservice}
     ports:
       - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 10s
@@ -21,8 +22,8 @@ services:
     container_name: ai-rabbitmq
     restart: always
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-aiservice}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:?Set RABBITMQ_PASS in .env}
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -35,35 +36,42 @@ services:
       retries: 5
 
   ai-service:
+    image: mycppaiservice-build:local
     build:
       context: .
       dockerfile: Dockerfile.build
     container_name: ai-httpserver
     restart: always
     volumes:
-      - ..:/workspace
-      - ${GEMMA_BUILD_DIR:-/home/qiuku/gemma.cpp/build}:/opt/gemma:ro
-      - ${GEMMA_SOURCE_DIR:-/home/qiuku/gemma.cpp}:/opt/gemma-src:ro
+      - ..:/workspace:ro
+      - app_build:/workspace/build
+      - ${GEMMA_BUILD_HOST_DIR:?Set GEMMA_BUILD_HOST_DIR in .env}:/opt/gemma:ro
+      - ${GEMMA_SOURCE_HOST_DIR:?Set GEMMA_SOURCE_HOST_DIR in .env}:/opt/gemma-src:ro
+      - ${GEMMA_MODELS_HOST_DIR:?Set GEMMA_MODELS_HOST_DIR in .env}:/opt/gemma-models:ro
     environment:
-      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
-      KNOWLEDGE_BASE_ID: ${KNOWLEDGE_BASE_ID}
-      BAIDU_CLIENT_ID: ${BAIDU_CLIENT_ID}
-      BAIDU_CLIENT_SECRET: ${BAIDU_CLIENT_SECRET}
-      DOUBAO_API_KEY: ${DOUBAO_API_KEY}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      KNOWLEDGE_BASE_ID: ${KNOWLEDGE_BASE_ID:-}
+      BAIDU_CLIENT_ID: ${BAIDU_CLIENT_ID:-}
+      BAIDU_CLIENT_SECRET: ${BAIDU_CLIENT_SECRET:-}
+      DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
       DB_HOST: mysql
       DB_PORT: 3306
       DB_USER: root
-      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      DB_NAME: ${MYSQL_DATABASE}
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      DB_NAME: ${MYSQL_DATABASE:-aiservice}
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER}
-      RABBITMQ_PASS: ${RABBITMQ_PASS}
-      LD_LIBRARY_PATH: /usr/local/lib
-      GEMMA_MODEL_PATH: ${GEMMA_MODEL_PATH:-/opt/gemma/2.0-2b-it-sfp.sbs}
-      GEMMA_TOKENIZER_PATH: ${GEMMA_TOKENIZER_PATH:-/opt/gemma/tokenizer.spm}
+      RABBITMQ_USER: ${RABBITMQ_USER:-aiservice}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:?Set RABBITMQ_PASS in .env}
+      GEMMA_MODEL_PATH: /opt/gemma-models/${GEMMA_MODEL_FILE:-2.0-2b-it-sfp.sbs}
+      GEMMA_TOKENIZER_PATH: /opt/gemma-models/${GEMMA_TOKENIZER_FILE:-tokenizer.spm}
       GEMMA_BUILD_DIR: /opt/gemma
       GEMMA_SOURCE_DIR: /opt/gemma-src
+      BUILD_JOBS: ${BUILD_JOBS:-2}
+      IMAGE_MAX_ENCODED_BYTES: ${IMAGE_MAX_ENCODED_BYTES:-16777216}
+      IMAGE_MAX_ORIGINAL_PIXELS: ${IMAGE_MAX_ORIGINAL_PIXELS:-16777216}
+      IMAGE_MAX_BGR_BYTES: ${IMAGE_MAX_BGR_BYTES:-67108864}
+      IMAGE_MAX_CONCURRENT_JOBS: ${IMAGE_MAX_CONCURRENT_JOBS:-2}
     ports:
       - "8116-8117:8116-8117"
     depends_on:
@@ -71,8 +79,9 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: ["sh", "-c", "cd /workspace/build && cmake .. && make && ./http_server -p 8117"]
+    command: ["sh", "/workspace/deploy/build-and-run.sh", "-p", "8117"]
 
 volumes:
   mysql_data:
   rabbitmq_data:
+  app_build:

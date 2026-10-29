@@ -1,0 +1,6 @@
+services:
+  app:
+    volumes:
+      # Keep the baseline's real production paths for a valid before-fix RED.
+      - ${IMAGE_MODELS_HOST_DIR:-/private/tmp/mycpp-integration/models}/mobilenetv2-7.onnx:/root/models/mobilenetv2/mobilenetv2-7.onnx:ro
+      - ${IMAGE_MODELS_HOST_DIR:-/private/tmp/mycpp-integration/models}/imagenet_classes.txt:/root/imagenet_classes.txt:ro

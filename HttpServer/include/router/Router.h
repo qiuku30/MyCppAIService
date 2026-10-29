@@ -63,14 +63,18 @@ public:
     void addRegexHandler(HttpRequest::Method method, const std::string &path, HandlerPtr handler)
     {
         std::regex pathRegex = convertToRegex(path);
-        regexHandlers_.emplace_back(method, pathRegex, handler);
+        regexHandlerLabels_.push_back(path);
+        try { regexHandlers_.emplace_back(method, pathRegex, handler); }
+        catch (...) { regexHandlerLabels_.pop_back(); throw; }
     }
 
     // 注册动态路由处理函数
     void addRegexCallback(HttpRequest::Method method, const std::string &path, const HandlerCallback &callback)
     {
         std::regex pathRegex = convertToRegex(path);
-        regexCallbacks_.emplace_back(method, pathRegex, callback);
+        regexCallbackLabels_.push_back(path);
+        try { regexCallbacks_.emplace_back(method, pathRegex, callback); }
+        catch (...) { regexCallbackLabels_.pop_back(); throw; }
     }
 
     // 处理请求
@@ -118,6 +122,9 @@ private:
     std::unordered_map<RouteKey, HandlerCallback, RouteKeyHash> callbacks_; // 精准匹配
     std::vector<RouteHandlerObj>                                regexHandlers_;     // 正则匹配
     std::vector<RouteCallbackObj>                               regexCallbacks_;   // 正则匹配
+    // Separate labels preserve the existing route entry layouts and bindings.
+    std::vector<std::string> regexHandlerLabels_;
+    std::vector<std::string> regexCallbackLabels_;
 };
 
 

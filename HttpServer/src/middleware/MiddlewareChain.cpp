@@ -32,9 +32,9 @@ void MiddlewareChain::processAfter(HttpResponse &response)
             }
         }
     }
-    catch (const std::exception &e)
+    catch (const std::exception &)
     {
-        LOG_ERROR << "Error in middleware after processing: " << e.what();
+        LOG_ERROR << "http_error category=middleware_after_exception";
     }
 }
 

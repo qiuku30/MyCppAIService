@@ -5,6 +5,9 @@
 namespace http
 {
 
+class HttpServer;
+namespace router { class Router; }
+
 class HttpResponse 
 {
 public:
@@ -19,18 +22,21 @@ public:
         k403Forbidden = 403,
         k404NotFound = 404,
         k409Conflict = 409,
+        k413PayloadTooLarge = 413,
         k500InternalServerError = 500,
+        k503ServiceUnavailable = 503,
     };
 
     HttpResponse(bool close = true)
-        : statusCode_(kUnknown)
+        : httpVersion_("HTTP/1.1")
+        , statusCode_(k500InternalServerError)
+        , statusMessage_("Internal Server Error")
         , closeConnection_(close)
     {}
 
     void setVersion(std::string version)
     { httpVersion_ = version; }
-    void setStatusCode(HttpStatusCode code)
-    { statusCode_ = code; }
+    void setStatusCode(HttpStatusCode code);
 
     HttpStatusCode getStatusCode() const
     { return statusCode_; }
@@ -81,13 +87,21 @@ public:
 
     void appendToBuffer(muduo::net::Buffer* outputBuf) const;
 private:
+    friend class HttpServer;
+    friend class router::Router;
+    // Only dispatch can set labels; handlers must not use request data here.
+    // This metadata is never serialized onto the response wire.
+    void setLogRoute(const std::string& route) { logRoute_ = route; }
+    const std::string& logRoute() const { return logRoute_; }
+
     std::string                        httpVersion_; 
     HttpStatusCode                     statusCode_;
     std::string                        statusMessage_;
     bool                               closeConnection_;
     std::map<std::string, std::string> headers_;
     std::string                        body_;
-    bool                               isFile_;
+    std::string                        logRoute_ = "callback";
+    bool                               isFile_ = false;
     bool                               streaming_ = false;  // SSE 流式标记
 };
 

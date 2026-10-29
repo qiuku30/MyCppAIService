@@ -1,339 +1,296 @@
 #include"../include/AIUtil/AIHelper.h"
 #include"../include/AIUtil/MQManager.h"
 #include"../include/AIUtil/GemmaInferencePool.h"
+#include"../include/AIUtil/ChatMessage.h"
+#include"../include/AIUtil/SecureId.h"
+#include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include<chrono>
 #include <muduo/base/Logging.h>
 
-AIHelper::AIHelper() {
-    strategy = StrategyFactory::instance().create("1");
-}
+AIHelper::AIHelper() = default;
 
 void AIHelper::setStrategy(std::shared_ptr<AIStrategy> strat) {
     strategy = strat;
 }
 
-void AIHelper::addMessage(int userId, const std::string& userName, bool is_user,
-                          const std::string& userInput, std::string sessionId) {
-    auto now = std::chrono::system_clock::now();
-    auto duration = now.time_since_epoch();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-    messages.push_back({userInput, ms});
-    // 异步入库：通过 RabbitMQ 解耦数据库写入
-    pushMessageToMysql(userId, userName, is_user, userInput, ms, sessionId);
+void AIHelper::restoreMessage(const std::string& userInput, long long ms) {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    messageRoles_.push_back(messages.size() % 2 == 0);
+    try {
+        messages.push_back({userInput, ms});
+    } catch (...) {
+        messageRoles_.pop_back();
+        throw;
+    }
 }
 
-void AIHelper::restoreMessage(const std::string& userInput, long long ms) {
-    messages.push_back({userInput, ms});
+void AIHelper::restoreMessage(const std::string& content, long long ms, bool isUser) {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    messageRoles_.push_back(isUser);
+    try {
+        messages.push_back({content, ms});
+    } catch (...) {
+        messageRoles_.pop_back();
+        throw;
+    }
+}
+
+void AIHelper::validateCanonicalHistory() const {
+    if (messages.size() != messageRoles_.size())
+        throw std::logic_error("Inconsistent stored chat history metadata");
+    if (messages.size() % 2 != 0)
+        throw std::runtime_error("Stored chat history has an incomplete exchange; start a new session to continue");
+    for (size_t i = 0; i < messageRoles_.size(); ++i) {
+        if (messageRoles_[i] != (i % 2 == 0))
+            throw std::runtime_error("Stored chat history has incompatible roles; start a new session to continue");
+    }
 }
 
 std::string AIHelper::chat(int userId, std::string userName, std::string sessionId,
                            std::string userQuestion, std::string modelType) {
     std::lock_guard<std::mutex> lock(chat_mutex_);
+    validateCanonicalHistory();
     setStrategy(StrategyFactory::instance().create(modelType));
 
-    // 本地模型：走 GemmaInferencePool
+    // Upstream requests are temporary snapshots. Commit only completed exchanges.
+    auto requestMessages = messages;
+    requestMessages.push_back({userQuestion, 0});
+    std::string answer;
     if (strategy->isLocal()) {
-        if (!GemmaInferencePool::instance().isLoaded()) {
-            return "[Error] Gemma model not loaded";
+        if (!GemmaInferencePool::instance().isLoaded())
+            throw std::runtime_error("Gemma model not loaded");
+        answer = GemmaInferencePool::instance().generateSyncFromHistory(
+            std::to_string(userId) + ":" + sessionId, requestMessages);
+    } else if (!strategy->isMCPModel) {
+        answer = strategy->parseResponse(executeCurl(strategy->buildRequest(requestMessages)));
+    } else {
+        AIConfig config;
+        if (!config.loadFromFile("../AIApps/ChatServer/resource/config.json"))
+            throw std::runtime_error("Tool configuration unavailable");
+        requestMessages.back().first = config.buildPrompt(userQuestion);
+        auto aiResult = strategy->parseResponse(executeCurl(strategy->buildRequest(requestMessages)));
+        auto call = config.parseAIResponse(aiResult);
+        if (!call.isToolCall) {
+            answer = aiResult;
+        } else {
+            AIToolRegistry registry;
+            auto toolResult = registry.invoke(call.toolName, call.args);
+            requestMessages.back().first = config.buildToolResultPrompt(
+                userQuestion, call.toolName, call.args, toolResult);
+            answer = strategy->parseResponse(executeCurl(strategy->buildRequest(requestMessages)));
         }
-        addMessage(userId, userName, true, userQuestion, sessionId);
-        std::string answer = GemmaInferencePool::instance().generateSync(
-            sessionId, userQuestion);
-        addMessage(userId, userName, false, answer, sessionId);
-        return answer.empty() ? "[Error] Empty response" : answer;
     }
-
-    // 非 MCP 模型：直接对话
-    if (false == strategy->isMCPModel) {
-        addMessage(userId, userName, true, userQuestion, sessionId);
-        json payload = strategy->buildRequest(this->messages);
-        json response = executeCurl(payload);
-        std::string answer = strategy->parseResponse(response);
-        addMessage(userId, userName, false, answer, sessionId);
-        return answer.empty() ? "[Error] 无法解析响应" : answer;
-    }
-
-    // MCP 模式：两阶段推理
-    // Phase 1: LLM 决策是否调用工具
-    AIConfig config;
-    config.loadFromFile("../AIApps/ChatServer/resource/config.json");
-    std::string tempUserQuestion = config.buildPrompt(userQuestion);
-    std::cout << "tempUserQuestion is " << tempUserQuestion << std::endl;
-
-    ScopedMessage phase1Guard(messages, tempUserQuestion);  // RAII: 离开作用域自动 pop
-
-    json firstReq = strategy->buildRequest(this->messages);
-    json firstResp = executeCurl(firstReq);
-    std::string aiResult = strategy->parseResponse(firstResp);
-
-    std::cout << "aiResult is " << aiResult << std::endl;
-
-    AIToolCall call = config.parseAIResponse(aiResult);
-
-    // LLM 未选择工具 → 当作普通回复
-    if (!call.isToolCall) {
-        addMessage(userId, userName, true, userQuestion, sessionId);
-        addMessage(userId, userName, false, aiResult, sessionId);
-        std::cout << "No tools required" << std::endl;
-        return aiResult;
-    }
-
-    // LLM 选择调用工具 → 执行 → Phase 2
-    json toolResult;
-    AIToolRegistry registry;
-
-    try {
-        toolResult = registry.invoke(call.toolName, call.args);
-        std::cout << "Tool call success" << std::endl;
-    } catch (const std::exception& e) {
-        std::string err = "[工具调用失败] " + std::string(e.what());
-        addMessage(userId, userName, true, userQuestion, sessionId);
-        addMessage(userId, userName, false, err, sessionId);
-        std::cout << "Tool call failed" << std::endl << std::string(e.what());
-        return err;
-    }
-
-    // Phase 2: 注入工具结果，LLM 生成自然语言回答
-    std::string secondPrompt = config.buildToolResultPrompt(
-        userQuestion, call.toolName, call.args, toolResult);
-    std::cout << "secondPrompt is " << secondPrompt << std::endl;
-
-    ScopedMessage phase2Guard(messages, secondPrompt);  // RAII: 异常安全
-
-    json secondReq = strategy->buildRequest(messages);
-    json secondResp = executeCurl(secondReq);
-    std::string finalAnswer = strategy->parseResponse(secondResp);
-
-    std::cout << "finalAnswer is " << finalAnswer << std::endl;
-
-    addMessage(userId, userName, true, userQuestion, sessionId);
-    addMessage(userId, userName, false, finalAnswer, sessionId);
-    return finalAnswer;
+    if (answer.empty()) throw std::runtime_error("Empty model response");
+    commitExchange(userId, userName, sessionId, userQuestion, answer);
+    return answer;
 }
 
 void AIHelper::chatStream(int userId, std::string userName, std::string sessionId,
                           std::string userQuestion, std::string modelType,
-                          std::function<void(const std::string& token)> on_token,
-                          std::function<void(const std::string& full_answer)> on_done,
-                          std::function<void(const std::string& error)> on_error) {
+                          std::function<void(const std::string&)> on_token,
+                          std::function<void(const std::string&)> on_done,
+                          std::function<void(const std::string&)> on_error) {
     try {
-        std::lock_guard<std::mutex> lock(chat_mutex_);
+        std::unique_lock<std::mutex> lock(chat_mutex_);
+        validateCanonicalHistory();
         setStrategy(StrategyFactory::instance().create(modelType));
+        if (strategy->isMCPModel) {
+            lock.unlock();
+            auto answer = chat(userId, userName, sessionId, userQuestion, modelType);
+            if (on_token) on_token(answer);
+            if (on_done) on_done(answer);
+            return;
+        }
 
-        // === 路径 1: 本地 Gemma 推理 ===
+        auto requestMessages = messages;
+        requestMessages.push_back({userQuestion, 0});
+        std::string full_text;
+        auto chunk = [&](const std::string& delta) {
+            full_text += delta;
+            if (on_token) on_token(delta);
+        };
         if (strategy->isLocal()) {
-            if (!GemmaInferencePool::instance().isLoaded()) {
-                on_error("Gemma model not loaded");
-                return;
-            }
-            addMessage(userId, userName, true, userQuestion, sessionId);
-
-            std::string full_text;
-            GemmaInferencePool::instance().generate(
-                sessionId, userQuestion,
-                [&full_text, &on_token](const std::string& token) {
-                    full_text += token;
-                    if (on_token) on_token(token);
-                });
-
-            addMessage(userId, userName, false, full_text, sessionId);
-            if (on_done) on_done(full_text);
-            return;
+            if (!GemmaInferencePool::instance().isLoaded())
+                throw std::runtime_error("Gemma model not loaded");
+            GemmaInferencePool::instance().generateFromHistory(
+                std::to_string(userId) + ":" + sessionId, requestMessages, chunk);
+        } else {
+            bool failed = false;
+            std::string failure;
+            executeCurlStream(strategy->buildStreamRequest(requestMessages), chunk, nullptr,
+                [&](const std::string& error) { failed = true; failure = error; });
+            if (failed) throw std::runtime_error(failure);
         }
-
-        // === 路径 2: 云端 API 非 MCP 流式 ===
-        if (!strategy->isMCPModel) {
-            addMessage(userId, userName, true, userQuestion, sessionId);
-            json payload = strategy->buildStreamRequest(this->messages);
-
-            std::string full_text;
-            executeCurlStream(payload,
-                // on_chunk
-                [&full_text, &on_token](const std::string& delta) {
-                    full_text += delta;
-                    if (on_token) on_token(delta);
-                },
-                // on_done (stream ended)
-                nullptr,
-                // on_error
-                [&on_error](const std::string& err) {
-                    if (on_error) on_error(err);
-                });
-
-            addMessage(userId, userName, false, full_text, sessionId);
-            if (on_done) on_done(full_text);
-            return;
-        }
-
-        // === 路径 3: MCP 两阶段推理（暂保持非流式） ===
-        AIConfig config;
-        config.loadFromFile("../AIApps/ChatServer/resource/config.json");
-        std::string tempUserQuestion = config.buildPrompt(userQuestion);
-
-        ScopedMessage streamPhase1Guard(messages, tempUserQuestion);
-        json firstReq = strategy->buildRequest(this->messages);
-        json firstResp = executeCurl(firstReq);
-        std::string aiResult = strategy->parseResponse(firstResp);
-
-        AIToolCall call = config.parseAIResponse(aiResult);
-
-        if (!call.isToolCall) {
-            addMessage(userId, userName, true, userQuestion, sessionId);
-            addMessage(userId, userName, false, aiResult, sessionId);
-            if (on_done) on_done(aiResult);
-            return;
-        }
-
-        json toolResult;
-        AIToolRegistry registry;
-        try {
-            toolResult = registry.invoke(call.toolName, call.args);
-        } catch (const std::exception& e) {
-            std::string err = "[Tool call failed] " + std::string(e.what());
-            addMessage(userId, userName, true, userQuestion, sessionId);
-            addMessage(userId, userName, false, err, sessionId);
-            if (on_done) on_done(err);
-            return;
-        }
-
-        std::string secondPrompt = config.buildToolResultPrompt(
-            userQuestion, call.toolName, call.args, toolResult);
-        ScopedMessage streamPhase2Guard(messages, secondPrompt);
-        json secondReq = strategy->buildRequest(messages);
-        json secondResp = executeCurl(secondReq);
-        std::string finalAnswer = strategy->parseResponse(secondResp);
-
-        addMessage(userId, userName, true, userQuestion, sessionId);
-        addMessage(userId, userName, false, finalAnswer, sessionId);
-        if (on_done) on_done(finalAnswer);
-
+        if (full_text.empty()) throw std::runtime_error("Empty model response");
+        commitExchange(userId, userName, sessionId, userQuestion, full_text);
+        if (on_done) on_done(full_text);
     } catch (const std::exception& e) {
         if (on_error) on_error(e.what());
     }
 }
 
 json AIHelper::request(const json& payload) {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    if (!strategy) strategy = StrategyFactory::instance().create("1");
     return executeCurl(payload);
 }
 
 std::vector<std::pair<std::string, long long>> AIHelper::GetMessages() {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
     return this->messages;
 }
 
+std::vector<AIHelper::HistoryMessage> AIHelper::GetHistorySnapshot() {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    if (messages.size() != messageRoles_.size())
+        throw std::logic_error("Inconsistent stored chat history metadata");
+    std::vector<HistoryMessage> snapshot;
+    snapshot.reserve(messages.size());
+    for (size_t i = 0; i < messages.size(); ++i)
+        snapshot.push_back({messages[i].first, messages[i].second, messageRoles_[i]});
+    return snapshot;
+}
+
 json AIHelper::executeCurl(const json& payload) {
+    const auto url = strategy->getApiUrl();
+    const auto payloadStr = payload.dump();
     CURL* curl = curl_easy_init();
     if (!curl) {
         throw std::runtime_error("Failed to initialize curl");
     }
 
-    std::cout << "test " << strategy->getApiUrl().c_str() << ' ' << strategy->getApiKey() << std::endl;
 
     std::string readBuffer;
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curlOwner(curl, &curl_easy_cleanup);
     struct curl_slist* headers = nullptr;
+    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headersOwner(nullptr, &curl_slist_free_all);
+    auto appendHeader = [&](const std::string& value) {
+        auto* next = curl_slist_append(headers, value.c_str());
+        if (!next) throw std::runtime_error("Failed to allocate curl request headers");
+        headersOwner.release();
+        headers = next;
+        headersOwner.reset(headers);
+    };
 
     std::string authHeader = "Authorization: Bearer " + strategy->getApiKey();
-    headers = curl_slist_append(headers, authHeader.c_str());
-    headers = curl_slist_append(headers, "Content-Type: application/json");
+    appendHeader(authHeader);
+    appendHeader("Content-Type: application/json");
 
-    std::string payloadStr = payload.dump();
-
-    curl_easy_setopt(curl, CURLOPT_URL, strategy->getApiUrl().c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payloadStr.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
 
     CURLcode res = curl_easy_perform(curl);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    headersOwner.reset();
+    curlOwner.reset();
 
     if (res != CURLE_OK) {
         throw std::runtime_error("curl_easy_perform() failed: " + std::string(curl_easy_strerror(res)));
     }
 
+    if (status < 200 || status >= 300)
+        throw std::runtime_error("Upstream HTTP error: " + std::to_string(status));
     try {
-        return json::parse(readBuffer);
-    } catch (...) {
-        throw std::runtime_error("Failed to parse JSON response: " + readBuffer);
+        auto response = json::parse(readBuffer);
+        if (response.contains("error") || (response.contains("code") &&
+            !response["code"].is_null() && response["code"] != "" &&
+            response["code"] != "200" && response["code"] != 200))
+            throw std::runtime_error("Upstream model reported an error");
+        return response;
+    } catch (const json::exception&) {
+        throw std::runtime_error("Failed to parse upstream JSON response");
     }
 }
 
 // SSE 流式 curl — 在 curl 写回调中实时解析 SSE，立刻回调 on_chunk
 void AIHelper::executeCurlStream(
-    const json& payload,
-    std::function<void(const std::string& delta)> on_chunk,
-    std::function<void()> on_done,
-    std::function<void(const std::string&)> on_error) {
-
+    const json& payload, std::function<void(const std::string&)> on_chunk,
+    std::function<void()> on_done, std::function<void(const std::string&)> on_error) {
+    const auto url = strategy->getApiUrl();
+    const auto extraHeaders = strategy->streamHeaders();
+    const auto data = payload.dump();
     CURL* curl = curl_easy_init();
-    if (!curl) {
-        if (on_error) on_error("Failed to initialize curl");
-        return;
-    }
-
-    struct curl_slist* headers = nullptr;
-    std::string authHeader = "Authorization: Bearer " + strategy->getApiKey();
-    headers = curl_slist_append(headers, authHeader.c_str());
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    std::string payloadStr = payload.dump();
-
-    curl_easy_setopt(curl, CURLOPT_URL, strategy->getApiUrl().c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payloadStr.c_str());
-
-    // 流式解析状态：跨多次写回调增量解析 SSE
-    struct StreamParseState {
-        std::string buffer;      // 未完成的行数据
-        std::shared_ptr<AIStrategy> strat;
-        std::function<void(const std::string&)> on_chunk;
-        std::function<void()> on_done;
+    if (!curl) { if (on_error) on_error("Failed to initialize curl"); return; }
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curlOwner(curl, &curl_easy_cleanup);
+    curl_slist* headers = nullptr;
+    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headersOwner(nullptr, &curl_slist_free_all);
+    auto appendHeader = [&](const std::string& value) {
+        auto* next = curl_slist_append(headers, value.c_str());
+        if (!next) throw std::runtime_error("Failed to allocate curl request headers");
+        headersOwner.release();
+        headers = next;
+        headersOwner.reset(headers);
     };
-    StreamParseState state;
-    state.strat = strategy;
-    state.on_chunk = on_chunk;
-    state.on_done = on_done;
-
+    auto auth = "Authorization: Bearer " + strategy->getApiKey();
+    appendHeader(auth);
+    appendHeader("Content-Type: application/json");
+    for (const auto& header : extraHeaders) appendHeader(header);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+    struct State {
+        std::string buffer, error;
+        std::shared_ptr<AIStrategy> strategy;
+        std::function<void(const std::string&)> chunk;
+        bool completed = false;
+    } state{{}, {}, strategy, on_chunk, false};
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-        +[](void* contents, size_t size, size_t nmemb, void* userp) -> size_t {
-            size_t total = size * nmemb;
-            auto* st = static_cast<StreamParseState*>(userp);
-            st->buffer.append(static_cast<char*>(contents), total);
-
-            // 按行增量解析 SSE（每行以 \n 结尾）
-            size_t pos;
-            while ((pos = st->buffer.find('\n')) != std::string::npos) {
-                std::string line = st->buffer.substr(0, pos);
-                st->buffer.erase(0, pos + 1);
-
-                // 去掉行尾 \r
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-
-                const std::string prefix = "data: ";
-                if (line.compare(0, prefix.size(), prefix) != 0) continue;
-
-                std::string data = line.substr(prefix.size());
-                if (data == "[DONE]") {
-                    if (st->on_done) st->on_done();
-                    continue;
+        +[](void* contents, size_t size, size_t nmemb, void* context) -> size_t {
+            auto& state = *static_cast<State*>(context);
+            const size_t total = size * nmemb;
+            try {
+                state.buffer.append(static_cast<char*>(contents), total);
+                size_t pos;
+                while ((pos = state.buffer.find('\n')) != std::string::npos) {
+                    auto line = state.buffer.substr(0, pos);
+                    state.buffer.erase(0, pos + 1);
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.compare(0, 5, "data:") != 0) continue;
+                    auto event = line.substr(5);
+                    if (!event.empty() && event.front() == ' ') event.erase(0, 1);
+                    if (event == "[DONE]") { state.completed = true; continue; }
+                    if (event.empty()) continue;
+                    auto parsed = json::parse(event);
+                    if (parsed.contains("error") || (parsed.contains("code") &&
+                        !parsed["code"].is_null() && parsed["code"] != "" &&
+                        parsed["code"] != "200" && parsed["code"] != 200)) {
+                        state.error = "Upstream model reported an error";
+                        return 0;
+                    }
+                    if (state.completed) continue;
+                    std::string token;
+                    if (state.strategy->parseStreamChunk(event, token) && state.chunk)
+                        state.chunk(token);
+                    if (state.strategy->isStreamComplete(parsed)) state.completed = true;
                 }
-                std::string token_text;
-                if (st->strat->parseStreamChunk(data, token_text)) {
-                    if (st->on_chunk) st->on_chunk(token_text);
-                }
+            } catch (const std::exception&) {
+                state.error = "Invalid or failed stream callback";
+                return 0;
             }
             return total;
         });
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
-
-    CURLcode res = curl_easy_perform(curl);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK) {
-        if (on_error) on_error(std::string("curl error: ") + curl_easy_strerror(res));
-        return;
+    auto result = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    headersOwner.reset();
+    curlOwner.reset();
+    if (!state.error.empty()) {
+        if (on_error) on_error(state.error);
+    } else if (result != CURLE_OK) {
+        if (on_error) on_error(std::string("curl error: ") + curl_easy_strerror(result));
+    } else if (status < 200 || status >= 300) {
+        if (on_error) on_error("Upstream HTTP error: " + std::to_string(status));
+    } else if (!state.completed) {
+        if (on_error) on_error("Model stream ended before completion");
+    } else {
+        if (on_done) on_done();
     }
 }
 
@@ -344,42 +301,24 @@ size_t AIHelper::WriteCallback(void* contents, size_t size, size_t nmemb, void* 
     return totalSize;
 }
 
-std::string AIHelper::escapeString(const std::string& input) {
-    std::string output;
-    output.reserve(input.size() * 2);
-    for (char c : input) {
-        switch (c) {
-            case '\\': output += "\\\\"; break;
-            case '\'': output += "\\\'"; break;
-            case '\"': output += "\\\""; break;
-            case '\n': output += "\\n";  break;
-            case '\r': output += "\\r";  break;
-            case '\t': output += "\\t";  break;
-            default:   output += c; break;
-        }
-    }
-    return output;
-}
-
-void AIHelper::pushMessageToMysql(int userId, const std::string& userName, bool is_user,
-                                  const std::string& userInput, long long ms, std::string sessionId) {
-    std::string safeUserName = escapeString(userName);
-    std::string safeUserInput = escapeString(userInput);
-
-    std::string sql = "INSERT INTO chat_message (id, username, session_id, is_user, content, ts) VALUES ("
-        + std::to_string(userId) + ", "
-        + "'" + safeUserName + "', "
-        + sessionId + ", "
-        + std::to_string(is_user ? 1 : 0) + ", "
-        + "'" + safeUserInput + "', "
-        + std::to_string(ms) + ")";
-
-    // 异步投递到 RabbitMQ，消费者线程执行 SQL
-    // try-catch 保护：MQ 不可用时不影响对话主流程，消息已写入内存 messages 列表
-    try {
-        MQManager::instance().publish("sql_queue", sql);
-    } catch (const std::exception& e) {
-        LOG_ERROR << "Failed to publish message to MQ (chat continues in memory): " << e.what()
-                  << " | sql=" << sql.substr(0, 200);
-    }
+void AIHelper::commitExchange(int userId, const std::string& userName,
+    const std::string& sessionId, const std::string& question, const std::string& answer) {
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!messages.empty() && messages.back().second >= std::numeric_limits<long long>::max() - 2)
+        throw std::overflow_error("Invalid restored chat timestamp");
+    long long ts = messages.empty() ? now : std::max<long long>(now, messages.back().second + 1);
+    ChatExchange exchange{secureId(), userId, userName, sessionId, question, answer, ts};
+    auto body = exchange.serialize();
+    ChatExchange::parse(body); // Validate bounds before queue admission.
+    auto updated = messages;
+    updated.push_back({question, ts});
+    updated.push_back({answer, ts + 1});
+    auto updatedRoles = messageRoles_;
+    updatedRoles.push_back(true);
+    updatedRoles.push_back(false);
+    if (!MQManager::instance().publish("sql_queue", body))
+        throw std::runtime_error("Chat history queue unavailable or full; exchange not accepted");
+    messages.swap(updated);
+    messageRoles_.swap(updatedRoles);
 }

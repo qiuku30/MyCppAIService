@@ -1,4 +1,5 @@
 #include "../include/handlers/ChatRegisterHandler.h"
+#include "../../../../HttpServer/include/utils/PasswordUtil.h"
 
 
 void ChatRegisterHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
@@ -43,29 +44,15 @@ void ChatRegisterHandler::handle(const http::HttpRequest& req, http::HttpRespons
 
 int ChatRegisterHandler::insertUser(const std::string& username, const std::string& password)
 {
-
-    if (!isUserExist(username))
-    {
-
-        std::string sql = "INSERT INTO users (username, password) VALUES ('" + username + "', '" + password + "')";
-        mysqlUtil_.executeUpdate(sql);
-        std::string sql2 = "SELECT id FROM users WHERE username = '" + username + "'";
-        auto res = mysqlUtil_.executeQuery(sql2);
-        if (res->next())
-        {
-            return res->getInt("id");
-        }
-    }
-    return -1;
+    if (isUserExist(username)) return -1;
+    const auto encoded = http::PasswordUtil::hash(password);
+    mysqlUtil_.executeUpdate("INSERT INTO users (username, password) VALUES (?, ?)", username, encoded);
+    return mysqlUtil_.consumeQuery("SELECT id FROM users WHERE username = ?",
+        [](sql::ResultSet& result) { return result.next() ? result.getInt("id") : -1; }, username);
 }
 
 bool ChatRegisterHandler::isUserExist(const std::string& username)
 {
-    std::string sql = "SELECT id FROM users WHERE username = '" + username + "'";
-    auto res = mysqlUtil_.executeQuery(sql);
-    if (res->next())
-    {
-        return true;
-    }
-    return false;
+    return mysqlUtil_.consumeQuery("SELECT id FROM users WHERE username = ?",
+        [](sql::ResultSet& result) { return result.next(); }, username);
 }

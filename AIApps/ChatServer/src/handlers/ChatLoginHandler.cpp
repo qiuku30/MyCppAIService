@@ -1,4 +1,6 @@
 #include "../include/handlers/ChatLoginHandler.h"
+#include "../../../../HttpServer/include/utils/PasswordUtil.h"
+#include <utility>
 
 void ChatLoginHandler::handle(const http::HttpRequest& req, http::HttpResponse* resp)
 {
@@ -6,7 +8,7 @@ void ChatLoginHandler::handle(const http::HttpRequest& req, http::HttpResponse* 
     auto contentType = req.getHeader("Content-Type");
     if (contentType.empty() || contentType != "application/json" || req.getBody().empty())
     {
-        LOG_INFO << "content" << req.getBody();
+
         resp->setStatusLine(req.getVersion(), http::HttpResponse::k400BadRequest, "Bad Request");
         resp->setCloseConnection(true);
         resp->setContentType("application/json");
@@ -64,11 +66,11 @@ void ChatLoginHandler::handle(const http::HttpRequest& req, http::HttpResponse* 
             return;
         }
     }
-    catch (const std::exception& e)
+    catch (const std::exception&)
     {
         json failureResp;
         failureResp["status"] = "error";
-        failureResp["message"] = e.what();
+        failureResp["message"] = "Login failed";
         std::string failureBody = failureResp.dump(4);
 
         resp->setStatusLine(req.getVersion(), http::HttpResponse::k400BadRequest, "Bad Request");
@@ -83,16 +85,23 @@ void ChatLoginHandler::handle(const http::HttpRequest& req, http::HttpResponse* 
 
 int ChatLoginHandler::queryUserId(const std::string& username, const std::string& password)
 {
+    const auto account = mysqlUtil_.consumeQuery(
+        "SELECT id, password FROM users WHERE username = ?",
+        [](sql::ResultSet& result) {
+            if (!result.next()) return std::make_pair(-1, std::string{});
+            return std::make_pair(result.getInt("id"), std::string(result.getString("password")));
+        }, username);
+    if (account.first == -1) return -1;
 
-    std::string sql = "SELECT id FROM users WHERE username = ? AND password = ?";
-    // std::vector<std::string> params = {username, password};
-    auto res = mysqlUtil_.executeQuery(sql, username, password);
-    if (res->next())
-    {
-        int id = res->getInt("id");
-        return id;
+    if (http::PasswordUtil::isHash(account.second)) {
+        return http::PasswordUtil::verify(password, account.second) ? account.first : -1;
     }
+    if (!http::PasswordUtil::verifyLegacy(password, account.second)) return -1;
 
-    return -1;
+    // Upgrade only the exact credential just verified; never overwrite a newer password.
+    const auto encoded = http::PasswordUtil::hash(password);
+    const int changed = mysqlUtil_.executeUpdate(
+        "UPDATE users SET password = ? WHERE id = ? AND BINARY password = ?",
+        encoded, std::to_string(account.first), account.second);
+    return changed == 1 ? account.first : -1;
 }
-

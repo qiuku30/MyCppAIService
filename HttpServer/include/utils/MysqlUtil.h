@@ -17,11 +17,11 @@ public:
             host, user, password, database, poolSize);
     }
 
-    template<typename... Args>
-    sql::ResultSet* executeQuery(const std::string& sql, Args&&... args)
+    template<typename Consumer, typename... Args>
+    auto consumeQuery(const std::string& sql, Consumer&& consume, Args&&... args)
     {
         auto conn = http::db::DbConnectionPool::getInstance().getConnection();
-        return conn->executeQuery(sql, std::forward<Args>(args)...);
+        return conn->consumeQuery(sql, std::forward<Consumer>(consume), std::forward<Args>(args)...);
     }
 
     template<typename... Args>

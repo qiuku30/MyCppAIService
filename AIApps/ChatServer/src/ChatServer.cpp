@@ -15,6 +15,8 @@
 #include"../include/handlers/ChatSpeechHandler.h"
 
 #include "../include/ChatServer.h"
+#include <limits>
+#include <stdexcept>
 #include "../../../HttpServer/include/http/HttpRequest.h"
 #include "../../../HttpServer/include/http/HttpResponse.h"
 #include "../../../HttpServer/include/http/HttpServer.h"
@@ -60,54 +62,39 @@ void ChatServer::initChatMessage() {
 }
 
 void ChatServer::readDataFromMySQL() {
+    decltype(chatInformation) restoredChats;
+    decltype(sessionsIdsMap) restoredSessionIds;
+    const std::string query = "SELECT id, username, session_id, is_user, content, ts FROM chat_message ORDER BY ts ASC, id ASC";
+    mysqlUtil_.consumeQuery(query, [&](sql::ResultSet& result) {
+        while (result.next()) {
+            const auto storedUserId = result.getInt64("id");
+            const std::string sessionId = result.getString("session_id");
+            const std::string content = result.getString("content");
+            const auto timestamp = result.getInt64("ts");
+            const auto role = result.getInt("is_user");
+            if (storedUserId <= 0 || storedUserId > std::numeric_limits<int>::max())
+                throw std::runtime_error("Stored chat history has an invalid user id");
+            if (role != 0 && role != 1)
+                throw std::runtime_error("Stored chat history has an invalid message role");
 
-
-    std::string sql = "SELECT id, username,session_id, is_user, content, ts FROM chat_message ORDER BY ts ASC, id ASC";
-
-    sql::ResultSet* res;
-    try {
-        res = mysqlUtil_.executeQuery(sql);
-    }
-    catch (const std::exception& e) {
-        std::cerr << "MySQL query failed: " << e.what() << std::endl;
-        return;
-    }
-
-    while (res->next()) {
-        long long user_id = 0;
-        std::string session_id ;  
-        std::string username, content;
-        long long ts = 0;
-        int is_user = 1;
-
-        try {
-            user_id    = res->getInt64("id");       
-            session_id = res->getString("session_id");  
-            username   = res->getString("username");
-            content    = res->getString("content");
-            ts         = res->getInt64("ts");
-            is_user    = res->getInt("is_user");
+            const int userId = static_cast<int>(storedUserId);
+            auto& sessions = restoredChats[userId];
+            auto& helper = sessions[sessionId];
+            if (!helper) {
+                helper = std::make_shared<AIHelper>();
+                restoredSessionIds[userId].push_back(sessionId);
+            }
+            helper->restoreMessage(content, timestamp, role == 1);
         }
-        catch (const std::exception& e) {
-            std::cerr << "Failed to read row: " << e.what() << std::endl;
-            continue; 
-        }
+    });
 
-        auto& userSessions = chatInformation[user_id];
-
-        std::shared_ptr<AIHelper> helper;
-        auto itSession = userSessions.find(session_id);
-        if (itSession == userSessions.end()) {
-            helper = std::make_shared<AIHelper>();
-            userSessions[session_id] = helper;
-			sessionsIdsMap[user_id].push_back(session_id);
-        } else {
-            helper = itSession->second;
-        }
-
-        helper->restoreMessage(content, ts);
+    // The query, traversal, decoding and helper construction must all succeed
+    // before either live map changes. Retrying replaces the snapshot.
+    {
+        std::scoped_lock lock(mutexForChatInformation, mutexForSessionsId);
+        chatInformation.swap(restoredChats);
+        sessionsIdsMap.swap(restoredSessionIds);
     }
-
     std::cout << "readDataFromMySQL finished" << std::endl;
 }
 

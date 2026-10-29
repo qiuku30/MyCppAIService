@@ -11,3 +11,19 @@ failed_sql.log
 
 # 真实密钥（只提交 .env.example 模板）
 .env
+stack.env
+harness-state.json
+
+# 本地工具状态与执行笔记
+/.serena/
+/.superpowers/
+/task_plan.md
+/progress.md
+/findings.md
+/tests/integration/task_plan.md
+/tests/integration/progress.md
+/tests/integration/findings.md
+
+# Python 测试缓存
+__pycache__/
+*.pyc

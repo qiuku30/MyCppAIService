@@ -136,15 +136,16 @@ private:
                    muduo::Timestamp receiveTime);
 
     //HTTP 请求处理入口函数
-    void onRequest(const muduo::net::TcpConnectionPtr&, const HttpRequest&);
+    // Returns true only when another ordinary request may use the connection.
+    bool onRequest(const muduo::net::TcpConnectionPtr&, const HttpRequest&);
 
     //HTTP 业务核心处理函数
     void handleRequest(const HttpRequest& req, HttpResponse* resp);
     
 private:
     muduo::net::InetAddress                      listenAddr_; // 监听地址（ip地址和端口号）
+    muduo::net::EventLoop                        mainLoop_; // 必须先构造、后析构，供 TcpServer 全生命周期使用
     muduo::net::TcpServer                        server_;  //管理 TCP 连接的接受、关闭、数据收发和事件分发
-    muduo::net::EventLoop                        mainLoop_; // 主循环
     HttpCallback                                 httpCallback_; // 回调函数
     router::Router                               router_; // 路由表，存储注册的路径与处理函数的映射
     std::unique_ptr<session::SessionManager>     sessionManager_; // 会话管理器

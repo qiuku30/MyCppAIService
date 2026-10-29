@@ -101,10 +101,10 @@ std::string AISpeechProcessor::recognize(const std::string& speechData,
             }
         }
     } catch (...) {
-        std::cout << "Parse error in recognize response: " << result << std::endl;
+        std::cout << "speech_error category=recognize_parse_error" << std::endl;
     }
 
-    std::cout << "Recognize failed, response: " << result << std::endl;
+    std::cout << "speech_error category=recognize_failed" << std::endl;
     return "";
 }
 

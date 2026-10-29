@@ -61,13 +61,14 @@ bool CorsMiddleware::isOriginAllowed(const std::string& origin) const
 void CorsMiddleware::handlePreflightRequest(const HttpRequest& request, 
                                           HttpResponse& response) 
 {
+    response.setVersion(request.getVersion());
     //获取请求源标识
     const std::string& origin = request.getHeader("Origin");
     
     //校验请求源合法性
     if (!isOriginAllowed(origin)) 
     {
-        LOG_WARN << "Origin not allowed: " << origin;
+        LOG_WARN << "http_error category=cors_origin_denied";
         response.setStatusCode(HttpResponse::k403Forbidden);
         return;
     }
@@ -114,10 +115,10 @@ void CorsMiddleware::addCorsHeaders(HttpResponse& response,
         
         LOG_DEBUG << "CORS headers added successfully";
     } 
-    catch (const std::exception& e) 
+    catch (const std::exception&)
     {
         // 添加头部过程中出现任何异常都会被捕获，避免影响正常响应流程
-        LOG_ERROR << "Error adding CORS headers: " << e.what();
+        LOG_ERROR << "http_error category=cors_headers_exception";
     }
 }
 

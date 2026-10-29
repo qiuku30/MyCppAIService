@@ -1,5 +1,8 @@
 #include"../include/AIUtil/AIStrategy.h"
 #include"../include/AIUtil/AIFactory.h"
+#include <algorithm>
+#include <cstdlib>
+#include <stdexcept>
 
 // ========== AIStrategy 默认流式接口实现 ==========
 
@@ -114,11 +117,14 @@ std::string DouBaoStrategy::parseResponse(const json& response) const {
 
 
 std::string AliyunRAGStrategy::getApiUrl() const {
-    const char* key = std::getenv("Knowledge_Base_ID");
-    if (!key) throw std::runtime_error("Knowledge_Base_ID not found!");
-    std::string id(key);
-    //϶Ӧ֪ʶID
-    return "https://dashscope.aliyuncs.com/api/v1/apps/"+id+"/completion";
+    const char* value = std::getenv("KNOWLEDGE_BASE_ID");
+    if (!value) value = std::getenv("Knowledge_Base_ID"); // Legacy configuration.
+    const std::string id = value ? value : "";
+    if (id.empty() || id.size() > 128 || !std::all_of(id.begin(), id.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '-' || c == '_';
+        })) throw std::runtime_error("KNOWLEDGE_BASE_ID must contain the DashScope application ID");
+    return "https://dashscope.aliyuncs.com/api/v1/apps/" + id + "/completion";
 }
 
 std::string AliyunRAGStrategy::getApiKey()const {
@@ -152,6 +158,46 @@ std::string AliyunRAGStrategy::parseResponse(const json& response) const {
     }
     return {};
 }
+
+json AliyunRAGStrategy::buildStreamRequest(
+    const std::vector<std::pair<std::string, long long>>& messages) const {
+    auto payload = buildRequest(messages);
+    payload["parameters"]["incremental_output"] = true;
+    return payload;
+}
+
+std::vector<std::string> AliyunRAGStrategy::streamHeaders() const {
+    return {"X-DashScope-SSE: enable", "Accept: text/event-stream"};
+}
+
+bool AliyunRAGStrategy::parseStreamChunk(const std::string& event, std::string& text) const {
+    text.clear();
+    try {
+        auto parsed = json::parse(event);
+        if (!parsed.contains("output") || !parsed["output"].is_object()) return false;
+        const auto& output = parsed["output"];
+        if (output.contains("text") && output["text"].is_string()) {
+            text = output["text"].get<std::string>();
+            return !text.empty();
+        }
+    } catch (const json::exception&) {}
+    return false;
+}
+
+bool AliyunRAGStrategy::isStreamComplete(const json& event) const {
+    if (!event.contains("output")) return false;
+    if (!event["output"].is_object())
+        throw std::runtime_error("Invalid DashScope application output");
+    const auto& output = event["output"];
+    if (output.contains("text") && !output["text"].is_string())
+        throw std::runtime_error("Invalid DashScope application text");
+    if (!output.contains("finish_reason") || output["finish_reason"].is_null()) return false;
+    const auto reason = output["finish_reason"].get<std::string>();
+    if (reason.empty() || reason == "null") return false;
+    if (reason == "stop") return true;
+    throw std::runtime_error("DashScope application stream did not finish normally");
+}
+
 
 
 

@@ -1,126 +1,120 @@
-cmake_minimum_required(VERSION 3.10)
-project(http_server)
+cmake_minimum_required(VERSION 3.16)
+project(http_server LANGUAGES CXX)
 
-# 设置 C++ 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 查找 OpenSSL 和 CURL
+find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui imgcodecs videoio dnn)
 
-# Gemma.cpp 预编译库路径（可通过环境变量覆盖）
-set(GEMMA_BUILD_DIR "$ENV{GEMMA_BUILD_DIR}")
-if(NOT GEMMA_BUILD_DIR OR GEMMA_BUILD_DIR STREQUAL "")
-    set(GEMMA_BUILD_DIR /home/qiuku/gemma.cpp/build)
+# Cache arguments take precedence over the environment. Both trees must match
+# the pinned Gemma revision, target architecture and compiler ABI (deploy/README.md).
+set(GEMMA_SOURCE_DIR "$ENV{GEMMA_SOURCE_DIR}" CACHE PATH "Gemma source tree")
+set(GEMMA_BUILD_DIR "$ENV{GEMMA_BUILD_DIR}" CACHE PATH "Gemma build tree")
+set(ONNXRUNTIME_ROOT "$ENV{ONNXRUNTIME_ROOT}" CACHE PATH "ONNX Runtime installation prefix")
+
+find_path(MYSQLCPPCONN_INCLUDE_DIR mysql_driver.h
+    PATH_SUFFIXES mysql-cppconn-8/jdbc mysql-cppconn-8 mysql-cppconn/jdbc)
+find_library(MYSQLCPPCONN_LIBRARY NAMES mysqlcppconn)
+find_path(MYSQL_INCLUDE_DIR mysql/mysql.h)
+find_library(MYSQLCLIENT_LIBRARY NAMES mysqlclient)
+find_path(MUDUO_INCLUDE_DIR muduo/net/TcpServer.h)
+find_library(MUDUO_NET_LIBRARY NAMES muduo_net)
+find_library(MUDUO_BASE_LIBRARY NAMES muduo_base)
+find_path(AMQPCPP_INCLUDE_DIR amqpcpp.h)
+find_library(AMQPCPP_LIBRARY NAMES amqpcpp)
+find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+    HINTS "${ONNXRUNTIME_ROOT}" PATH_SUFFIXES include include/onnxruntime/core/session)
+find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
+    HINTS "${ONNXRUNTIME_ROOT}" PATH_SUFFIXES lib lib64)
+find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
+    HINTS "${GEMMA_BUILD_DIR}/_deps/json-src/include")
+
+find_path(GEMMA_INCLUDE_DIR gemma/gemma.h HINTS "${GEMMA_SOURCE_DIR}"
+    NO_CMAKE_FIND_ROOT_PATH)
+find_library(GEMMA_LIBRARY NAMES gemma HINTS "${GEMMA_BUILD_DIR}"
+    NO_CMAKE_FIND_ROOT_PATH)
+find_path(HIGHWAY_INCLUDE_DIR hwy/base.h
+    HINTS "${GEMMA_BUILD_DIR}/_deps/highway-src" NO_CMAKE_FIND_ROOT_PATH)
+find_library(HIGHWAY_LIBRARY NAMES hwy
+    HINTS "${GEMMA_BUILD_DIR}/_deps/highway-build" NO_CMAKE_FIND_ROOT_PATH)
+find_library(HIGHWAY_CONTRIB_LIBRARY NAMES hwy_contrib
+    HINTS "${GEMMA_BUILD_DIR}/_deps/highway-build" NO_CMAKE_FIND_ROOT_PATH)
+find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h
+    HINTS "${GEMMA_BUILD_DIR}/_deps/sentencepiece-src/src" NO_CMAKE_FIND_ROOT_PATH)
+find_library(SENTENCEPIECE_LIBRARY NAMES sentencepiece
+    HINTS "${GEMMA_BUILD_DIR}/_deps/sentencepiece-build/src" NO_CMAKE_FIND_ROOT_PATH)
+
+function(require_dependencies)
+    foreach(variable IN LISTS ARGN)
+        if(NOT DEFINED ${variable} OR NOT EXISTS "${${variable}}")
+            message(FATAL_ERROR
+                "Missing dependency ${variable}. Set -D${variable}=<path>, "
+                "CMAKE_PREFIX_PATH, or the documented Gemma build/source paths.")
+        endif()
+    endforeach()
+endfunction()
+
+require_dependencies(
+    MYSQLCPPCONN_INCLUDE_DIR MYSQLCPPCONN_LIBRARY MYSQL_INCLUDE_DIR MYSQLCLIENT_LIBRARY
+    MUDUO_INCLUDE_DIR MUDUO_NET_LIBRARY MUDUO_BASE_LIBRARY
+    AMQPCPP_INCLUDE_DIR AMQPCPP_LIBRARY
+    ONNXRUNTIME_INCLUDE_DIR ONNXRUNTIME_LIBRARY NLOHMANN_JSON_INCLUDE_DIR
+    GEMMA_INCLUDE_DIR GEMMA_LIBRARY HIGHWAY_INCLUDE_DIR HIGHWAY_LIBRARY
+    HIGHWAY_CONTRIB_LIBRARY SENTENCEPIECE_INCLUDE_DIR SENTENCEPIECE_LIBRARY
+)
+if(NOT EXISTS "${AMQPCPP_INCLUDE_DIR}/amqpcpp/linux_tcp/tcpconnection.h")
+    message(FATAL_ERROR "AMQPCPP_INCLUDE_DIR must provide AMQP-CPP Linux TCP headers.")
 endif()
-set(GEMMA_SOURCE_DIR "$ENV{GEMMA_SOURCE_DIR}")
-if(NOT GEMMA_SOURCE_DIR OR GEMMA_SOURCE_DIR STREQUAL "")
-    set(GEMMA_SOURCE_DIR /home/qiuku/gemma.cpp)
+
+# Imported libraries retain explicit paths; no user-specific global link directories.
+add_library(gemma_external STATIC IMPORTED)
+set_target_properties(gemma_external PROPERTIES IMPORTED_LOCATION "${GEMMA_LIBRARY}")
+add_library(highway_external STATIC IMPORTED)
+set_target_properties(highway_external PROPERTIES IMPORTED_LOCATION "${HIGHWAY_LIBRARY}")
+add_library(highway_contrib_external STATIC IMPORTED)
+set_target_properties(highway_contrib_external PROPERTIES
+    IMPORTED_LOCATION "${HIGHWAY_CONTRIB_LIBRARY}"
+    INTERFACE_LINK_LIBRARIES highway_external)
+add_library(sentencepiece_external STATIC IMPORTED)
+set_target_properties(sentencepiece_external PROPERTIES
+    IMPORTED_LOCATION "${SENTENCEPIECE_LIBRARY}")
+target_link_libraries(gemma_external INTERFACE
+    highway_contrib_external highway_external sentencepiece_external)
+
+file(GLOB_RECURSE HTTP_SERVER_SRC CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/HttpServer/src/*.cpp")
+file(GLOB_RECURSE CHAT_SERVER_SRC CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/AIApps/ChatServer/src/*.cpp")
+add_executable(http_server ${HTTP_SERVER_SRC} ${CHAT_SERVER_SRC})
+target_include_directories(http_server PRIVATE
+    "${PROJECT_SOURCE_DIR}"
+    "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_SOURCE_DIR}/HttpServer/include"
+    "${PROJECT_SOURCE_DIR}/AIApps/ChatServer/include"
+    "${MYSQLCPPCONN_INCLUDE_DIR}" "${MYSQL_INCLUDE_DIR}" "${MUDUO_INCLUDE_DIR}"
+    "${AMQPCPP_INCLUDE_DIR}" "${ONNXRUNTIME_INCLUDE_DIR}" "${NLOHMANN_JSON_INCLUDE_DIR}"
+    "${GEMMA_INCLUDE_DIR}" "${HIGHWAY_INCLUDE_DIR}" "${SENTENCEPIECE_INCLUDE_DIR}"
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(http_server PRIVATE
+    "${MUDUO_NET_LIBRARY}" "${MUDUO_BASE_LIBRARY}"
+    "${MYSQLCPPCONN_LIBRARY}" "${MYSQLCLIENT_LIBRARY}"
+    "${AMQPCPP_LIBRARY}" "${ONNXRUNTIME_LIBRARY}"
+    gemma_external ${OpenCV_LIBS}
+    CURL::libcurl OpenSSL::SSL OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS}
+)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # SentencePiece bundles protobuf-lite; OpenCV DNN loads the system protobuf.
+    # Keep the archive's symbols private so its different ABI cannot interpose
+    # on the shared system runtime during initialization, before main().
+    get_filename_component(SENTENCEPIECE_ARCHIVE_NAME "${SENTENCEPIECE_LIBRARY}" NAME)
+    target_link_options(http_server PRIVATE
+        "LINKER:--exclude-libs,${SENTENCEPIECE_ARCHIVE_NAME}")
 endif()
-
-# 添加头文件路径
-include_directories(
-    ${PROJECT_SOURCE_DIR}
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/HttpServer/include
-    ${PROJECT_SOURCE_DIR}/AIApps/ChatServer/include
-    /usr/include/mysql-cppconn-8
-    /usr/include/mysql
-    ${OPENSSL_INCLUDE_DIR}
-    ${CURL_INCLUDE_DIRS}
-    /usr/include/opencv4          # OpenCV 头文件路径
-    /usr/local/include            # ONNX Runtime
-    /home/qiuku/.local/include    # AMQP-CPP (local install)
-    ${GEMMA_SOURCE_DIR}           # Gemma.cpp 根目录
-    ${GEMMA_BUILD_DIR}/_deps/sentencepiece-src/src  # SentencePiece
-    ${GEMMA_BUILD_DIR}/_deps/highway-src             # Highway
-    ${GEMMA_BUILD_DIR}/_deps/json-src/include        # nlohmann/json (gemma 依赖)
-)
-
-# 查找必要的库
-find_library(MYSQLCPPCONN_LIBRARY
-    NAMES mysqlcppconn mysqlcppconn8
-    PATHS /usr/lib /usr/lib64 /usr/local/lib
-)
-
-find_library(ONNXRUNTIME_LIBRARY
-    NAMES onnxruntime
-    PATHS /usr/lib /usr/lib64 /usr/local/lib
-)
-
-# 添加源文件
-file(GLOB_RECURSE HTTP_SERVER_SRC
-    "${PROJECT_SOURCE_DIR}/HttpServer/src/*.cpp"
-)
-
-file(GLOB_RECURSE GOMOKU_SERVER_SRC
-    "${PROJECT_SOURCE_DIR}/AIApps/ChatServer/src/*.cpp"
-)
-
-# 主程序文件
-set(MAIN_SRC "${PROJECT_SOURCE_DIR}/AIApps/ChatServer/src/main.cpp")
-
-# Gemma.cpp 预编译静态库（IMPORTED 目标）
-add_library(libgemma STATIC IMPORTED GLOBAL)
-set_target_properties(libgemma PROPERTIES IMPORTED_LOCATION ${GEMMA_BUILD_DIR}/libgemma.a)
-
-add_library(hwy STATIC IMPORTED GLOBAL)
-set_target_properties(hwy PROPERTIES IMPORTED_LOCATION ${GEMMA_BUILD_DIR}/_deps/highway-build/libhwy.a)
-
-add_library(hwy_contrib STATIC IMPORTED GLOBAL)
-set_target_properties(hwy_contrib PROPERTIES IMPORTED_LOCATION ${GEMMA_BUILD_DIR}/_deps/highway-build/libhwy_contrib.a)
-
-add_library(sentencepiece-static STATIC IMPORTED GLOBAL)
-set_target_properties(sentencepiece-static PROPERTIES IMPORTED_LOCATION ${GEMMA_BUILD_DIR}/_deps/sentencepiece-build/src/libsentencepiece.a)
-
-# 添加可执行文件
-add_executable(http_server
-    ${MAIN_SRC}
-    ${HTTP_SERVER_SRC}
-    ${GOMOKU_SERVER_SRC}
-)
-
-# 链接库
-target_link_libraries(http_server
-    pthread
-    muduo_net
-    muduo_base
-    mysqlcppconn
-    mysqlclient
-    ssl
-    crypto
-    ${CURL_LIBRARIES}
-    ${OPENCV4_LIBRARIES}
-    /usr/lib/x86_64-linux-gnu/libopencv_core.so
-    /usr/lib/x86_64-linux-gnu/libopencv_imgproc.so
-    /usr/lib/x86_64-linux-gnu/libopencv_highgui.so
-    /usr/lib/x86_64-linux-gnu/libopencv_imgcodecs.so
-    /usr/lib/x86_64-linux-gnu/libopencv_videoio.so
-    /usr/lib/x86_64-linux-gnu/libopencv_dnn.so
-
-    ${ONNXRUNTIME_LIBRARY}        # 自动查找的 ONNX Runtime 库
-
-    /home/qiuku/.local/lib/libamqpcpp.a   # AMQP-CPP
-
-    # Gemma.cpp 本地推理引擎（顺序重要：libgemma → hwy → hwy_contrib → sentencepiece）
-    libgemma
-    hwy
-    hwy_contrib
-    sentencepiece-static
-)
-
-# 如果库不在默认路径，添加链接目录
-link_directories(/usr/local/lib /home/qiuku/.local/lib)
-
-# 打印调试信息
-message(STATUS "Include directories:")
-get_property(dirs DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES)
-foreach(dir ${dirs})
-    message(STATUS "  ${dir}")
-endforeach()
-
+message(STATUS "AMQP-CPP library: ${AMQPCPP_LIBRARY}")
 message(STATUS "ONNX Runtime library: ${ONNXRUNTIME_LIBRARY}")
-message(STATUS "Main source file: ${MAIN_SRC}")
-message(STATUS "HTTP Server sources: ${HTTP_SERVER_SRC}")
-message(STATUS "Gomoku Server sources: ${GOMOKU_SERVER_SRC}")
+message(STATUS "Gemma library: ${GEMMA_LIBRARY}")

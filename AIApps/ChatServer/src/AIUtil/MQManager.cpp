@@ -1,411 +1,305 @@
 #include "../include/AIUtil/MQManager.h"
-#include <cstdlib>
-#include <ctime>
-#include <chrono>
-#include <fstream>
+#include "../../../../HttpServer/include/utils/JsonUtil.h"
 #include <muduo/base/Logging.h>
+#include <cstdlib>
+#include <algorithm>
+#include <stdexcept>
 
-// pendingQueue_ 容量上限：超过此值后新的 publish 请求会被丢弃并打 LOG_ERROR
-// 防止 RabbitMQ 长时间不可用时内存无限增长
-static constexpr size_t MAX_PENDING_SIZE = 10000;
-
-// ============================================================
-// MQManager::Handler 实现
-// ============================================================
-
-// ---- 构造 / 析构 ----
-
-// 构造函数仅保存参数，不做任何 I/O 操作。
-// 调用 connect() 才会真正发起 TCP 连接。
 MQManager::Handler::Handler(muduo::net::EventLoop* loop,
-                             const AMQP::Address& address,
-                             const std::string& queueName,
-                             MessageHandler onMessage)
-    : loop_(loop)
-    , address_(address)
-    , queueName_(queueName)
-    , messageHandler_(std::move(onMessage))
-{
-}
+    const AMQP::Address& address, const std::string& queue, MessageHandler handler)
+    : loop_(loop), address_(address), queueName_(queue),
+      messageHandler_(std::move(handler)) {}
 
-// 析构顺序很重要：
-//   1. *alive_ = false → 阻止所有待处理的跨线程回调（queueInLoop + timer）
-//   2. muduoChannel_.reset() → 从 epoll 移除监听
-//   3. consumerChannel_.reset() → producerChannel_.reset() → 关闭 AMQP Channel
-//   4. connection_.reset() → 关闭 TCP 连接
-// 不调用 loop_->cancel() 是因为 MQManager 是 static 单例，析构晚于
-// ChatServer（栈变量），此时 EventLoop 可能已销毁。定时器回调已有 alive 保护。
 MQManager::Handler::~Handler() {
-    *alive_ = false;
+    alive_->store(false);
     shuttingDown_ = true;
-    muduoChannel_.reset();
+    while (!channels_.empty()) retireFd(channels_.begin()->first);
     consumerChannel_.reset();
     producerChannel_.reset();
     connection_.reset();
 }
 
-// 发起 TCP 连接到 RabbitMQ。
-// 创建 TcpConnection 后，AMQP-CPP 自动开始非阻塞连接流程：
-// DNS 解析 → TCP 握手 → AMQP 协议握手 → onConnected() 回调
+void MQManager::Handler::retireFd(int fd) {
+    auto it = channels_.find(fd);
+    if (it == channels_.end()) return;
+    auto channel = it->second;
+    channel->disableAll();
+    channel->remove();
+    channels_.erase(it);
+    // monitor() may be called by AMQP from inside this Channel's callback.
+    loop_->queueInLoop([channel]() {});
+}
+
 void MQManager::Handler::connect() {
-    connection_ = std::make_unique<AMQP::TcpConnection>(this, address_);
-}
-
-// 断开连接，清理所有 Channel 和 epoll 监听。
-// pendingQueue_ 不清理——消息暂存，重连后继续发送。
-// reset 顺序：muduoChannel（停 epoll）→ channels（停 AMQP）→ connection（断 TCP）
-void MQManager::Handler::disconnect() {
-    muduoChannel_.reset();
-    consumerChannel_.reset();
-    producerChannel_.reset();
-    connection_.reset();
-    producerReady_ = false;
-    consumerReady_ = false;
-}
-
-// ---- AMQP::TcpHandler 回调 ----
-
-// monitor — AMQP-CPP 请求监听 socket fd
-//   fd    — 要监听的 fd（-1 无效）
-//   flags — AMQP::readable（可读）/ AMQP::writable（可写）的位掩码
-//           flags==0 表示停止监听
-// 实现：用 muduo::net::Channel 包装 fd，注册到 EventLoop 的 epoll。
-// fd 变化时（重连后新 socket）自动重建 Channel。
-void MQManager::Handler::monitor(AMQP::TcpConnection* /*connection*/, int fd, int flags) {
-    if (fd < 0) return;
-
-    // 重连后 fd 变了 → 销毁旧 Channel，创建新的
-    if (currentFd_ != fd) {
-        muduoChannel_.reset();
-        currentFd_ = fd;
-    }
-
-    if (flags == 0) {
-        // AMQP-CPP 请求停止监听
-        muduoChannel_.reset();
-        currentFd_ = -1;
+    loop_->assertInLoopThread();
+    recovering_ = false;
+    constructingConnection_ = true;
+    try {
+        connection_ = std::make_unique<AMQP::TcpConnection>(this, address_);
+    } catch (...) {
+        constructingConnection_ = false;
+        connectionFailed();
         return;
     }
-
-    if (!muduoChannel_) {
-        muduoChannel_ = std::make_unique<muduo::net::Channel>(loop_, fd);
-
-        // fd 可读 → 数据从 RabbitMQ 到达 → 喂给 AMQP-CPP 解析
-        muduoChannel_->setReadCallback([this](muduo::Timestamp) {
-            if (connection_ && currentFd_ >= 0) {
-                connection_->process(currentFd_, AMQP::readable);
-            }
-        });
-
-        // fd 可写 → AMQP-CPP 内部 buffer 有数据要发送 → 发送完成后尝试排空 pendingQueue_
-        muduoChannel_->setWriteCallback([this]() {
-            if (connection_ && currentFd_ >= 0) {
-                connection_->process(currentFd_, AMQP::writable);
-                drainPending();
-            }
-        });
-
-        // 对端关闭连接（记录日志，重连由 onLost/onError 处理）
-        muduoChannel_->setCloseCallback([this]() {
-            LOG_WARN << "AMQP connection closed by peer";
-        });
-    }
-
-    // 按 AMQP-CPP 要求控制 epoll 监听开关
-    if (flags & AMQP::readable) muduoChannel_->enableReading();
-    else                       muduoChannel_->disableReading();
-
-    if (flags & AMQP::writable) muduoChannel_->enableWriting();
-    else                        muduoChannel_->disableWriting();
+    constructingConnection_ = false;
 }
 
-// onConnected — TCP 连接 + AMQP 握手完成后回调
-// 在这里创建 Producer 和 Consumer 两个 Channel。
-// 同时重置重连间隔（连接成功 → 退避归零）。
-void MQManager::Handler::onConnected(AMQP::TcpConnection* /*connection*/) {
+void MQManager::Handler::disconnect() {
+    loop_->assertInLoopThread();
+    ++generation_;
+    producerReady_ = false;
+    while (!channels_.empty()) retireFd(channels_.begin()->first);
+    // Unconfirmed sends are ambiguous, so retain and resend their stable IDs.
+    for (auto it = inflight_.rbegin(); it != inflight_.rend(); ++it)
+        pending_.push_front(std::move(it->second));
+    inflight_.clear();
+    nextPublishTag_ = 1;
+    auto consumer = std::shared_ptr<AMQP::TcpChannel>(std::move(consumerChannel_));
+    auto producer = std::shared_ptr<AMQP::TcpChannel>(std::move(producerChannel_));
+    auto connection = std::shared_ptr<AMQP::TcpConnection>(std::move(connection_));
+    auto self = shared_from_this();
+    loop_->queueInLoop([self, consumer, producer, connection]() mutable {
+        consumer.reset(); producer.reset(); connection.reset();
+    });
+}
+
+void MQManager::Handler::stop() {
+    loop_->assertInLoopThread();
+    shuttingDown_ = true;
+    alive_->store(false);
+    loop_->cancel(reconnectTimerId_);
+    disconnect();
+}
+
+void MQManager::Handler::monitor(AMQP::TcpConnection* connection, int fd, int flags) {
+    if (fd < 0 || shuttingDown_) return;
+    if (!constructingConnection_ && connection != connection_.get()) return;
+    if (!flags) { retireFd(fd); return; }
+    auto it = channels_.find(fd);
+    if (it == channels_.end()) {
+        auto channel = std::make_shared<muduo::net::Channel>(loop_, fd);
+        auto weak = weak_from_this();
+        channel->setReadCallback([weak, fd](muduo::Timestamp) {
+            if (auto self = weak.lock(); self && self->alive_->load() &&
+                self->connection_ && !self->recovering_)
+                self->connection_->process(fd, AMQP::readable);
+        });
+        channel->setWriteCallback([weak, fd]() {
+            if (auto self = weak.lock(); self && self->alive_->load() &&
+                self->connection_ && !self->recovering_) {
+                self->connection_->process(fd, AMQP::writable);
+                self->drainPending();
+            }
+        });
+        channel->setCloseCallback([weak]() {
+            if (auto self = weak.lock()) self->connectionFailed();
+        });
+        it = channels_.emplace(fd, std::move(channel)).first;
+    }
+    if (flags & AMQP::readable) it->second->enableReading();
+    else it->second->disableReading();
+    if (flags & AMQP::writable) it->second->enableWriting();
+    else it->second->disableWriting();
+}
+
+void MQManager::Handler::connectionFailed() {
+    if (shuttingDown_ || recovering_) return;
+    recovering_ = true;
+    producerReady_ = false;
+    auto weak = weak_from_this();
+    loop_->queueInLoop([weak]() {
+        if (auto self = weak.lock(); self && self->alive_->load()) {
+            self->disconnect();
+            self->scheduleReconnect();
+        }
+    });
+}
+
+void MQManager::Handler::onConnected(AMQP::TcpConnection*) {
     reconnectDelaySec_ = 5;
-    LOG_INFO << "MQManager connected to RabbitMQ";
     setupProducer();
     startConsumer();
 }
+void MQManager::Handler::onLost(AMQP::TcpConnection*) { connectionFailed(); }
+void MQManager::Handler::onError(AMQP::TcpConnection*, const char*) { connectionFailed(); }
 
-// onLost — 连接断开后回调（仅在 onConnected 之后触发）
-// 清理 + 调度重连。
-void MQManager::Handler::onLost(AMQP::TcpConnection* /*connection*/) {
-    LOG_WARN << "MQManager lost connection to RabbitMQ";
-    disconnect();
-    if (!shuttingDown_) {
-        scheduleReconnect();
-    }
-}
-
-// onError — 连接错误回调
-// 注意：如果从未连上过（如 RabbitMQ 未启动），onLost 不会被跟随调用，
-// 因此这里也需显式触发重连。reconnectScheduled_ 防止 onLost 重复调度。
-void MQManager::Handler::onError(AMQP::TcpConnection* /*connection*/, const char* message) {
-    LOG_ERROR << "MQManager connection error: " << message;
-    disconnect();
-    if (!shuttingDown_) {
-        scheduleReconnect();
-    }
-}
-
-// ---- Channel 管理 ----
-
-// 创建 Producer Channel。
-// 就绪后设置 producerReady_=true 并排空 pendingQueue_ 中的暂存消息。
 void MQManager::Handler::setupProducer() {
     producerChannel_ = std::make_unique<AMQP::TcpChannel>(connection_.get());
-
+    producerChannel_->onError([this](const char*) { connectionFailed(); });
+    producerChannel_->recall().onReceived(
+        [this](const AMQP::Message&, int16_t, const std::string&) { connectionFailed(); });
     producerChannel_->onReady([this]() {
-        producerReady_ = true;
-        LOG_INFO << "MQManager producer channel ready";
-        drainPending();
-    });
-
-    producerChannel_->onError([this](const char* msg) {
-        producerReady_ = false;
-        LOG_ERROR << "MQManager producer channel error: " << msg;
+        // Declare every destination before allowing publishes (including quarantine).
+        producerChannel_->declareQueue(queueName_, AMQP::durable)
+            .onSuccess([this](const std::string&, uint32_t, uint32_t) {
+                producerChannel_->declareQueue(queueName_ + ".dead", AMQP::durable)
+                    .onSuccess([this](const std::string&, uint32_t, uint32_t) {
+                        producerChannel_->confirmSelect()
+                            .onSuccess([this]() { producerReady_ = true; drainPending(); })
+                            .onAck([this](uint64_t tag, bool multiple) { confirm(tag, multiple, true); })
+                            .onNack([this](uint64_t tag, bool multiple, bool /*requeue*/) { confirm(tag, multiple, false); });
+                    })
+                    .onError([this](const char*) { connectionFailed(); });
+            })
+            .onError([this](const char*) { connectionFailed(); });
     });
 }
 
-// 创建 Consumer Channel。
-// 流程：声明持久化队列 → 设置 QoS=1（每次预取一条，公平分发）→ 开始消费。
-// 收到消息时通过 onReceived → onConsumerMessage → messageHandler_ 链回调业务层。
 void MQManager::Handler::startConsumer() {
     consumerChannel_ = std::make_unique<AMQP::TcpChannel>(connection_.get());
-
+    consumerChannel_->onError([this](const char*) { connectionFailed(); });
     consumerChannel_->onReady([this]() {
-        // durable=true: 队列在 RabbitMQ 重启后不丢失
         consumerChannel_->declareQueue(queueName_, AMQP::durable)
-            .onSuccess([this](const std::string& /*name*/,
-                              uint32_t /*msgCount*/, uint32_t /*consumerCount*/) {
-                // QoS=1: 每次只预取一条消息，多个消费者可公平分发
+            .onSuccess([this](const std::string&, uint32_t, uint32_t) {
                 consumerChannel_->setQos(1);
-                // 开始消费（consumerTag 由服务端自动分配）
                 consumerChannel_->consume(queueName_)
-                    .onReceived([this](const AMQP::Message& msg,
-                                       uint64_t deliveryTag, bool /*redelivered*/) {
-                        onConsumerMessage(msg, deliveryTag, false);
+                    .onReceived([this](const AMQP::Message& msg, uint64_t tag, bool again) {
+                        onConsumerMessage(msg, tag, again);
                     })
-                    .onSuccess([this](const std::string& tag) {
-                        consumerTag_ = tag;
-                        consumerReady_ = true;
-                        LOG_INFO << "MQManager consumer ready, tag=" << tag;
-                    })
-                    .onError([this](const char* error) {
-                        consumerReady_ = false;
-                        LOG_ERROR << "MQManager consume failed: " << error;
-                    });
+                    .onError([this](const char*) { connectionFailed(); });
             })
-            .onError([this](const char* error) {
-                LOG_ERROR << "MQManager declareQueue failed: " << error;
-            });
-    });
-
-    consumerChannel_->onError([this](const char* msg) {
-        consumerReady_ = false;
-        LOG_ERROR << "MQManager consumer channel error: " << msg;
+            .onError([this](const char*) { connectionFailed(); });
     });
 }
 
-// ---- 消息回调 ----
-
-// 从 AMQP Message 中提取 body，构造线程安全的 ackFn，回调业务 handler。
-//   msg         — AMQP 消息对象
-//   deliveryTag — 投递标签（用于 ACK/NACK）
-//   redelivered — 是否为重新投递（当前未使用）
-//
-// ackFn 内置 queueInLoop，业务 handler 可在任意线程安全调用。
-//
-// 注意：messageHandler_ 在 EventLoop 线程中同步调用。
-// 如果业务 handler 包含阻塞 I/O（如数据库写入），应将其投递到工作线程执行，
-// 避免阻塞 EventLoop 导致心跳超时。
 void MQManager::Handler::onConsumerMessage(const AMQP::Message& msg,
-                                            uint64_t deliveryTag, bool /*redelivered*/) {
-    std::string body(msg.body(), msg.bodySize());
-
-    // 线程安全的 ack 函数：通过 queueInLoop 将 AMQP 操作切回 EventLoop 线程
-    //   ack=true  → ACK 确认（消息从队列删除）
-    //   ack=false → REJECT + requeue（消息重新入队，交给其他消费者）
-    auto ackFn = [this, alive = alive_, deliveryTag](bool ack) {
-        loop_->queueInLoop([this, alive, deliveryTag, ack]() {
-            if (!*alive) return;
-            if (!consumerChannel_) return;
-            if (ack) {
-                consumerChannel_->ack(deliveryTag);
-            } else {
-                consumerChannel_->reject(deliveryTag, AMQP::requeue);
-            }
-        });
+                                            uint64_t tag, bool) {
+    auto body = std::string(msg.body(), msg.bodySize());
+    auto weak = weak_from_this();
+    auto once = std::make_shared<std::atomic<bool>>(false);
+    auto generation = generation_;
+    auto ack = [weak, once, generation, tag, body](Disposition result) {
+        if (once->exchange(true)) return;
+        if (auto self = weak.lock()) self->loop_->queueInLoop(
+            [weak, generation, tag, body, result]() {
+                if (auto owner = weak.lock(); owner && owner->alive_->load())
+                    owner->completeDelivery(generation, tag, result, body);
+            });
     };
-
     try {
-        if (messageHandler_) {
-            messageHandler_(body, deliveryTag, std::move(ackFn));
-        }
-    } catch (const std::exception& e) {
-        // 兜底：业务 handler 抛出未捕获异常 → 落盘到 failed_sql.log 并 ACK
-        LOG_ERROR << "MQManager message handler threw: " << e.what()
-                  << " | msg=" << body.substr(0, 200);
-        {
-            std::ofstream failedFile("failed_sql.log", std::ios::app);
-            if (failedFile.is_open()) {
-                auto now = std::chrono::system_clock::now();
-                auto t = std::chrono::system_clock::to_time_t(now);
-                char timeBuf[32];
-                std::strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
-                failedFile << "[" << timeBuf << "] error=" << e.what()
-                           << " | " << body << std::endl;
+        if (messageHandler_) messageHandler_(body, tag, ack);
+        else ack(Disposition::Retry);
+    } catch (...) { ack(Disposition::Retry); }
+}
+
+void MQManager::Handler::completeDelivery(uint64_t generation, uint64_t tag,
+                                           Disposition result, std::string body) {
+    if (generation != generation_ || !consumerChannel_ || recovering_) return;
+    if (result == Disposition::Ack) { consumerChannel_->ack(tag); return; }
+    std::string target = queueName_ + ".dead";
+    double delay = 0.0;
+    if (result == Disposition::Retry) {
+        try {
+            auto job = json::parse(body);
+            int attempt = job.value("_attempt", 0);
+            if (attempt >= 0 && attempt < 5) {
+                job["_attempt"] = attempt + 1;
+                body = job.dump();
+                target = queueName_;
+                delay = std::min(30.0, static_cast<double>(1 << attempt));
             }
-        }
-        consumerChannel_->ack(deliveryTag);
+        } catch (...) {} // Legacy/unparseable bodies are quarantined, never executed.
     }
-}
-
-// ---- 重连 ----
-
-// 指数退避重连：首次 5s，之后每次翻倍（5→10→20→40→60），上限 60s。
-// reconnectScheduled_ 防止重复调度（应对 onError + onLost 连续触发）。
-// 连接成功后 onConnected 中重置间隔为 5s。
-void MQManager::Handler::scheduleReconnect() {
-    if (shuttingDown_ || reconnectScheduled_) return;
-
-    LOG_INFO << "MQManager scheduling reconnect in " << reconnectDelaySec_ << " seconds";
-    reconnectScheduled_ = true;
-    reconnectTimerId_ = loop_->runAfter(reconnectDelaySec_, [this, alive = alive_]() {
-        if (!*alive) return;
-        reconnectScheduled_ = false;
-        if (!shuttingDown_) {
-            LOG_INFO << "MQManager attempting reconnect...";
-            reconnectDelaySec_ = std::min(reconnectDelaySec_ * 2, 60);
-            connect();
-        }
+    auto weak = weak_from_this();
+    loop_->runAfter(delay, [weak, generation, tag, target, body]() {
+        auto self = weak.lock();
+        if (!self || !self->alive_->load() || generation != self->generation_) return;
+        auto confirmed = [weak, generation, tag](bool ok) {
+            if (auto owner = weak.lock(); owner && owner->alive_->load() &&
+                generation == owner->generation_ && owner->consumerChannel_) {
+                if (ok) owner->consumerChannel_->ack(tag);
+                else owner->consumerChannel_->reject(tag, AMQP::requeue);
+            }
+        };
+        // ACK the original only after RabbitMQ confirms its replacement/quarantine.
+        if (!self->schedulePublish(target, body, confirmed)) confirmed(false);
     });
 }
 
-// ---- 消息暂存与排空 ----
-
-// 排空 pendingQueue_ 中的暂存消息。
-// 在 Producer Channel 就绪时（onReady）调用，也在 socket 可写时（write callback）调用。
-// 缓冲区满时停止（剩余消息留在队列等下次 writable 回调继续）。
-void MQManager::Handler::drainPending() {
-    std::lock_guard<std::mutex> lock(pendingMutex_);
-    size_t count = 0;
-    while (!pendingQueue_.empty()) {
-        auto& [queue, msg] = pendingQueue_.front();
-        if (!producerChannel_->publish("", queue, msg)) {
-            // AMQP-CPP 内部发送缓冲区满 → 停止，下次 writable 时继续
-            LOG_WARN << "MQManager drainPending buffer full, "
-                     << pendingQueue_.size() << " messages remaining";
-            break;
+bool MQManager::Handler::schedulePublish(std::string queue, std::string body,
+                                          Completion completion) {
+    if (!alive_->load()) return false;
+    auto count = outstanding_.load();
+    do {
+        if (count >= MaxPending) return false;
+    } while (!outstanding_.compare_exchange_weak(count, count + 1));
+    auto weak = weak_from_this();
+    loop_->queueInLoop([weak, item = Publication{std::move(queue), std::move(body),
+                                                std::move(completion)}]() mutable {
+        if (auto self = weak.lock(); self && self->alive_->load()) {
+            self->pending_.push_back(std::move(item));
+            self->drainPending();
         }
-        pendingQueue_.pop();
-        ++count;
-    }
-    if (count > 0) {
-        LOG_INFO << "MQManager drained " << count << " pending messages";
-    }
-}
-
-// ---- 发布 ----
-
-// 线程安全的 publish 入口。
-// 在任意线程调用 → 通过 queueInLoop 委托到 EventLoop 线程 → publishOnLoop 执行。
-// 捕获 alive_ 确保 Handler 析构后回调安全跳过。
-void MQManager::Handler::schedulePublish(std::string queue, std::string msg) {
-    auto alive = alive_;
-    loop_->queueInLoop([this, alive, q = std::move(queue), m = std::move(msg)]() {
-        if (!*alive) return;
-        publishOnLoop(q, m);
     });
-}
-
-// 在 EventLoop 线程中实际执行 publish。
-//   queue — 目标队列名（通常是 "" 即默认队列）
-//   msg   — 消息体
-// 返回 true=已发送或已暂存，false=队列满丢弃。
-//
-// 三种路径：
-//   1. Producer 就绪 → 直接 publish
-//   2. Producer 未就绪或发送失败 → 暂存到 pendingQueue_（有容量上限）
-//   3. pendingQueue_ 满 → 丢弃并打 LOG_ERROR
-bool MQManager::Handler::publishOnLoop(const std::string& queue, const std::string& msg) {
-    if (!producerReady_ || !producerChannel_) {
-        std::lock_guard<std::mutex> lock(pendingMutex_);
-        if (pendingQueue_.size() >= MAX_PENDING_SIZE) {
-            LOG_ERROR << "MQManager pending queue full (" << MAX_PENDING_SIZE
-                      << "), dropping message: " << msg.substr(0, 100);
-            return false;
-        }
-        pendingQueue_.emplace(queue, msg);
-        return true;
-    }
-
-    bool ok = producerChannel_->publish("", queue, msg);
-    if (!ok) {
-        LOG_WARN << "MQManager publish buffer full, queuing";
-        std::lock_guard<std::mutex> lock(pendingMutex_);
-        if (pendingQueue_.size() >= MAX_PENDING_SIZE) {
-            LOG_ERROR << "MQManager pending queue full, dropping: " << msg.substr(0, 100);
-            return false;
-        }
-        pendingQueue_.emplace(queue, msg);
-        return false;
-    }
     return true;
 }
 
-// ============================================================
-// MQManager 外层 — 单例 + 对外接口
-// ============================================================
-
-MQManager::MQManager() = default;
-
-MQManager::~MQManager() {
-    shutdown();
+void MQManager::Handler::drainPending() {
+    if (!producerReady_ || recovering_ || !producerChannel_) return;
+    while (!pending_.empty() && inflight_.size() < MaxInflight) {
+        auto& item = pending_.front();
+        AMQP::Envelope envelope(item.body.data(), item.body.size());
+        envelope.setDeliveryMode(2);
+        envelope.setContentType("application/json");
+        if (!producerChannel_->publish("", item.queue, envelope, AMQP::mandatory)) {
+            connectionFailed();
+            return;
+        }
+        inflight_.emplace(nextPublishTag_++, std::move(item));
+        pending_.pop_front();
+    }
 }
 
-// 启动 MQManager。
-// 从环境变量 RABBITMQ_HOST / RABBITMQ_USER / RABBITMQ_PASS 读取连接参数，
-// 创建 Handler 并发起连接。连接过程和后续 I/O 都在传入的 EventLoop 上完成。
-void MQManager::start(muduo::net::EventLoop* loop,
-                       const std::string& queueName,
-                       MessageHandler onMessage) {
-    loop_ = loop;
+void MQManager::Handler::confirm(uint64_t tag, bool multiple, bool accepted) {
+    if (recovering_ || shuttingDown_) return;
+    if (!accepted) { connectionFailed(); return; }
+    for (auto it = inflight_.begin(); it != inflight_.end();) {
+        if ((!multiple && it->first != tag) || (multiple && it->first > tag)) {
+            ++it; continue;
+        }
+        auto completion = std::move(it->second.completion);
+        it = inflight_.erase(it);
+        outstanding_.fetch_sub(1);
+        if (completion) completion(true);
+    }
+    drainPending();
+}
 
-    // 从环境变量读取 RabbitMQ 连接参数，未设则用默认值
-    const char* mq_host = std::getenv("RABBITMQ_HOST");
-    std::string host = mq_host ? mq_host : "localhost";
-    const char* mq_user = std::getenv("RABBITMQ_USER");
-    const char* mq_pass = std::getenv("RABBITMQ_PASS");
+void MQManager::Handler::scheduleReconnect() {
+    if (shuttingDown_ || reconnectScheduled_) return;
+    reconnectScheduled_ = true;
+    auto weak = weak_from_this();
+    reconnectTimerId_ = loop_->runAfter(reconnectDelaySec_, [weak]() {
+        if (auto self = weak.lock(); self && self->alive_->load()) {
+            self->reconnectScheduled_ = false;
+            self->reconnectDelaySec_ = std::min(60, self->reconnectDelaySec_ * 2);
+            self->connect();
+        }
+    });
+}
 
-    std::string connStr = "amqp://"
-        + std::string(mq_user ? mq_user : "guest") + ":"
-        + std::string(mq_pass ? mq_pass : "guest") + "@"
-        + host + ":5672/";
-
-    AMQP::Address address(connStr);
-    handler_ = std::make_unique<Handler>(loop, address, queueName, std::move(onMessage));
+MQManager::~MQManager() = default;
+void MQManager::start(muduo::net::EventLoop* loop, const std::string& queue,
+                       MessageHandler handler) {
+    loop->assertInLoopThread();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (handler_) throw std::logic_error("MQManager already started");
+    auto env = [](const char* key, const char* fallback) {
+        const char* value = std::getenv(key); return std::string(value ? value : fallback);
+    };
+    AMQP::Address address("amqp://" + env("RABBITMQ_USER", "guest") + ":" +
+        env("RABBITMQ_PASS", "guest") + "@" + env("RABBITMQ_HOST", "localhost") +
+        ":" + env("RABBITMQ_PORT", "5672") + "/");
+    handler_ = std::make_shared<Handler>(loop, address, queue, std::move(handler));
     handler_->connect();
-
-    LOG_INFO << "MQManager started, queue=" << queueName
-             << " host=" << host;
 }
-
-// 关闭 MQManager：销毁 Handler → 断开连接 → 清理所有资源
+bool MQManager::publish(const std::string& queue, const std::string& body) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return handler_ && handler_->schedulePublish(queue, body);
+}
 void MQManager::shutdown() {
-    if (handler_) {
-        handler_.reset();
-    }
-}
-
-// 发布消息到 RabbitMQ 队列。
-// 线程安全：内部通过 schedulePublish → queueInLoop 委托到 EventLoop 线程。
-void MQManager::publish(const std::string& queue, const std::string& msg) {
-    if (!handler_) {
-        LOG_ERROR << "MQManager::publish called before start()";
-        return;
-    }
-    handler_->schedulePublish(queue, msg);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!handler_) return;
+    handler_->stop();
+    handler_.reset();
 }

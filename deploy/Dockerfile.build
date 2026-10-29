@@ -1,40 +1,73 @@
-FROM huanheart/ai-service-based-on-http-framework-2
+FROM ubuntu:22.04 AS dependencies
 
-# 安装编译工具和所有开发依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake g++ make \
-    libopencv-dev \
-    libmysqlcppconn-dev \
-    librabbitmq-dev \
-    libboost-all-dev \
-    nlohmann-json3-dev \
-    libcurl4-openssl-dev \
-    libssl-dev \
-    # muduo 和 SimpleAmqpClient、ONNX Runtime 可能仍需手动安装，但我们可以直接使用宿主机的（因为它们在容器内重新编译会用到）
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
+ARG BUILD_JOBS=2
+ARG MUDUO_COMMIT=b55b0ac6a10d4ded1301c3172e779ec46ada2ab3
+ARG AMQPCPP_COMMIT=839f74f2e7cc0f3f03458ebf943d23fc1f8c5462
+ARG ONNXRUNTIME_VERSION=1.18.0
+ARG UBUNTU_PORTS_MIRROR=http://ports.ubuntu.com/ubuntu-ports
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-mycpp-retries \
+    && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
+         sed -i "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" /etc/apt/sources.list; \
+       fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates curl pkg-config \
+    libboost-dev libopencv-dev libmysqlcppconn-dev default-libmysqlclient-dev \
+    nlohmann-json3-dev libcurl4-openssl-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 手动安装 muduo 网络库
-RUN git clone https://github.com/chenshuo/muduo.git /tmp/muduo && \
-    cd /tmp/muduo && mkdir build && cd build && \
-    cmake .. && make && make install && \
-    rm -rf /tmp/muduo
+# v2.0.2's formatting reserve must also fit ARM64 binary128 long double.
+RUN git clone https://github.com/chenshuo/muduo.git /tmp/muduo \
+    && git -C /tmp/muduo checkout --detach "${MUDUO_COMMIT}" \
+    && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
+         sed -i 's/kMaxNumericSize = 32/kMaxNumericSize = 48/' /tmp/muduo/muduo/base/LogStream.h; \
+       fi \
+    && cmake -S /tmp/muduo -B /tmp/muduo/build \
+       -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DMUDUO_BUILD_EXAMPLES=OFF \
+    && cmake --build /tmp/muduo/build --parallel "${BUILD_JOBS}" \
+    && cmake --install /tmp/muduo/build \
+    && rm -rf /tmp/muduo
 
-# 手动安装 SimpleAmqpClient
-RUN git clone https://github.com/alanxz/SimpleAmqpClient.git /tmp/simpleamqp && \
-    cd /tmp/simpleamqp && mkdir build && cd build && \
-    cmake .. && make && make install && \
-    rm -rf /tmp/simpleamqp
+# MQManager uses AMQP-CPP's Linux TCP transport, including TcpConnection/TcpChannel.
+RUN git clone https://github.com/CopernicaMarketingSoftware/AMQP-CPP.git /tmp/amqpcpp \
+    && git -C /tmp/amqpcpp checkout --detach "${AMQPCPP_COMMIT}" \
+    && cmake -S /tmp/amqpcpp -B /tmp/amqpcpp/build \
+       -DCMAKE_BUILD_TYPE=Release -DAMQP-CPP_LINUX_TCP=ON -DAMQP-CPP_BUILD_SHARED=ON \
+    && cmake --build /tmp/amqpcpp/build --parallel "${BUILD_JOBS}" \
+    && cmake --install /tmp/amqpcpp/build \
+    && rm -rf /tmp/amqpcpp
 
-# 安装 ONNX Runtime (预编译包)
-RUN wget -qO- https://github.com/microsoft/onnxruntime/releases/download/v1.18.0/onnxruntime-linux-x64-1.18.0.tgz | \
-    tar -xz -C /opt && \
-    cp -r /opt/onnxruntime-linux-x64-1.18.0/include/* /usr/local/include/ && \
-    cp -r /opt/onnxruntime-linux-x64-1.18.0/lib/* /usr/local/lib/ && \
-    ldconfig && \
-    rm -rf /opt/onnxruntime-linux-x64-1.18.0
+# ARM64's official 1.18.0 binary loses cpuinfo cache owners under LTO.
+# Build a patched full CPU runtime in a separate stage; retain the x64 archive.
+FROM dependencies AS ort-builder
+COPY build-ort.sh ort-cpuinfo-ownership.patch /opt/mycpp/
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/var/cache/mycpp-ort \
+    set -eu; \
+    mkdir -p /opt/onnxruntime/include /opt/onnxruntime/lib; \
+    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+      arm64) \
+        test "${ONNXRUNTIME_VERSION}" = 1.18.0; \
+        ORT_WORK_DIR=/var/cache/mycpp-ort ORT_INSTALL_PREFIX=/opt/onnxruntime \
+          sh /opt/mycpp/build-ort.sh ;; \
+      amd64) \
+        ort_name="onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}"; \
+        curl -fSL --retry 5 --connect-timeout 30 "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/${ort_name}.tgz" -o /tmp/onnxruntime.tgz; \
+        tar -xzf /tmp/onnxruntime.tgz -C /tmp; \
+        cp -a "/tmp/${ort_name}/include/." /opt/onnxruntime/include/; \
+        cp -a "/tmp/${ort_name}/lib/." /opt/onnxruntime/lib/ ;; \
+      *) printf 'Unsupported ONNX Runtime architecture: %s\n' "${TARGETARCH}" >&2; exit 1 ;; \
+    esac
 
-# 设置工作目录（注意这里路径与挂载点对应）
+FROM dependencies
+COPY --from=ort-builder /opt/onnxruntime/ /usr/local/
+RUN ldconfig
+
 WORKDIR /workspace/build
-
-# 默认命令：编译并启动服务（首次启动时会自动编译，之后可手动重启编译）
-CMD ["sh", "-c", "cmake .. && make && ./http_server -p 8117"]
+CMD ["sh", "/workspace/deploy/build-and-run.sh"]
